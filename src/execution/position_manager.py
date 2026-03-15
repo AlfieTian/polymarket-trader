@@ -8,10 +8,15 @@ Tracks open positions and decides when to exit:
 - Edge reversal: exit if LLM reverses its view
 """
 
+import json
 import logging
+import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
+from pathlib import Path
+
+STATE_FILE = Path(__file__).parent.parent.parent / "logs" / "positions_state.json"
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +44,9 @@ class Position:
     market_price_at_entry: float
     opened_at: float = field(default_factory=time.time)
     end_date: str = ""  # ISO timestamp of market resolution
+    exit_retries: int = 0          # failed exit attempts so far
+    exit_price_override: float = 0.0  # lowered price after retries (0 = use market price)
+    force_close_failed: bool = False  # exit retries exhausted; manual intervention likely
 
     @property
     def current_value(self) -> float:
@@ -99,20 +107,85 @@ class PositionManager:
 
     def __init__(
         self,
-        profit_target_pct: float = 0.30,   # exit at +30% gain on position
-        stop_loss_pct: float = 0.40,        # exit at -40% loss on position
-        pre_resolution_hours: float = 2.0,  # exit 2h before resolution
-        min_edge_to_hold: float = 0.02,     # exit if edge drops below 2%
+        profit_target_pct: float = 0.08,
+        stop_loss_pct: float = 0.15,
+        pre_resolution_hours: float = 2.0,
+        min_edge_to_hold: float = 0.02,
+        exit_max_retries: int = 5,
+        exit_price_step: float = 0.01,
     ):
         self.profit_target_pct = profit_target_pct
         self.stop_loss_pct = stop_loss_pct
         self.pre_resolution_hours = pre_resolution_hours
         self.min_edge_to_hold = min_edge_to_hold
+        self.exit_max_retries = exit_max_retries
+        self.exit_price_step = exit_price_step
         self._positions: dict[str, Position] = {}
+        self._load_state()
+
+    # ─── Persistence ──────────────────────────────────────────
+    def _load_state(self):
+        """Restore positions from disk after restart."""
+        try:
+            if STATE_FILE.exists():
+                data = json.loads(STATE_FILE.read_text())
+                for d in data:
+                    p = Position(**d)
+                    self._positions[p.market_id] = p
+                logger.info(f"📂 Restored {len(self._positions)} positions from disk")
+        except Exception as e:
+            logger.warning(f"Could not restore position state: {e}")
+
+    def _save_state(self):
+        """Persist current positions to disk."""
+        try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            def _pos_dict(p):
+                d = asdict(p)
+                d.pop("_current_price", None)  # non-serializable runtime field
+                return d
+            payload = json.dumps([_pos_dict(p) for p in self._positions.values()], indent=2)
+            tmp_path = STATE_FILE.with_suffix(".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(payload)
+            # Atomic replace to avoid partial writes on crash
+            os.replace(tmp_path, STATE_FILE)
+        except Exception as e:
+            logger.warning(f"Could not save position state: {e}")
 
     def add_position(self, position: Position) -> None:
-        """Record a new open position."""
+        """Record a new open position.
+
+        If a position for this market_id already exists, accumulate into
+        the existing entry (weighted-average price, summed size) instead of
+        overwriting — prevents orphaned on-chain tokens when the bot buys
+        the same market twice across cycles.
+        """
+        existing = self._positions.get(position.market_id)
+        if existing is not None:
+            # Accumulate: weighted-average entry price, sum sizes
+            total_usdc = existing.size_usdc + position.size_usdc
+            total_size = existing.size + position.size
+            if total_size > 0:
+                existing.entry_price = (
+                    existing.entry_price * existing.size + position.entry_price * position.size
+                ) / total_size
+            existing.size = total_size
+            existing.size_usdc = total_usdc
+            # Keep the earlier opened_at and reset exit retry state
+            existing.exit_retries = 0
+            existing.exit_price_override = 0.0
+            existing.force_close_failed = False
+            self._save_state()
+            logger.warning(
+                f"📌 Accumulated into existing position: {position.market_id} {position.side} "
+                f"now {existing.size:.2f} shares @ ${existing.entry_price:.3f} "
+                f"(${existing.size_usdc:.2f} USDC total)"
+            )
+            return
+
         self._positions[position.market_id] = position
+        self._save_state()
         logger.info(
             f"📌 New position: {position.market_id} {position.side} "
             f"{position.size:.2f} shares @ ${position.entry_price:.3f} "
@@ -120,7 +193,10 @@ class PositionManager:
         )
 
     def close_position(self, market_id: str) -> Position | None:
-        return self._positions.pop(market_id, None)
+        pos = self._positions.pop(market_id, None)
+        if pos:
+            self._save_state()
+        return pos
 
     def get_position(self, market_id: str) -> Position | None:
         return self._positions.get(market_id)
@@ -165,8 +241,21 @@ class PositionManager:
 
             exit_signal = None
 
+            # 0. Pre-resolution (HIGHEST priority — must exit before market resolves
+            #    regardless of edge or P&L; past end_date also triggers this)
+            if pos.hours_to_resolution <= self.pre_resolution_hours:
+                exit_signal = ExitSignal(
+                    position=pos,
+                    reason=ExitReason.PRE_RESOLUTION,
+                    current_price=effective_price,
+                    message=(
+                        f"Market resolves in {pos.hours_to_resolution:.1f}h "
+                        f"(closing {self.pre_resolution_hours:.0f}h before resolution)"
+                    ),
+                )
+
             # 1. Stop loss
-            if pos.unrealized_pnl_pct <= -self.stop_loss_pct:
+            elif pos.unrealized_pnl_pct <= -self.stop_loss_pct:
                 exit_signal = ExitSignal(
                     position=pos,
                     reason=ExitReason.STOP_LOSS,
@@ -206,18 +295,6 @@ class PositionManager:
                             f"< min_hold {self.min_edge_to_hold:.3f}"
                         ),
                     )
-
-            # 4. Pre-resolution
-            elif pos.hours_to_resolution <= self.pre_resolution_hours:
-                exit_signal = ExitSignal(
-                    position=pos,
-                    reason=ExitReason.PRE_RESOLUTION,
-                    current_price=effective_price,
-                    message=(
-                        f"Market resolves in {pos.hours_to_resolution:.1f}h "
-                        f"(closing {self.pre_resolution_hours:.0f}h before resolution)"
-                    ),
-                )
 
             if exit_signal:
                 logger.info(
