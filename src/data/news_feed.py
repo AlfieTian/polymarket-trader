@@ -239,7 +239,11 @@ Respond in JSON format ONLY:
         )
         resp.raise_for_status()
         data = resp.json()
-        text = data["choices"][0]["message"]["content"]
+        # o4-mini may return reasoning tokens with empty content - handle gracefully
+        text = data["choices"][0]["message"].get("content") or ""
+        if not text.strip():
+            logger.debug(f"Empty LLM response for {market_id} (reasoning model)")
+            return None
         return self._parse_llm_response(text, market_id, headlines)
 
     def _parse_llm_response(self, text: str, market_id: str, headlines: list[str]) -> LLMAnalysis | None:
