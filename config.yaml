@@ -1,0 +1,30 @@
+polymarket:
+  api_key: ""
+  private_key: ""
+  clob_url: "https://clob.polymarket.com"
+  rest_url: "https://gamma-api.polymarket.com"
+  dry_run: true
+
+bayesian:
+  prior_weight: 0.7
+  min_observations: 3
+
+strategy:
+  min_edge: 0.03
+  kelly_fraction: 0.25
+  max_position_usdc: 100
+  max_portfolio_usdc: 1000
+
+risk:
+  max_daily_loss_usdc: 200
+  max_market_concentration: 0.3
+
+lmsr:
+  b: 100000
+
+trading:
+  loop_interval_s: 60
+
+logging:
+  level: INFO
+  file: logs/trader.log
