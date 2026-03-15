@@ -192,10 +192,11 @@ Respond in JSON format ONLY:
 {{"probability": 0.XX, "confidence": 0.XX, "reasoning": "..."}}"""
 
         try:
-            if self._anthropic_key:
-                return await self._call_anthropic(prompt, market.id, headlines)
-            elif self._openai_key:
+            # Prefer OpenAI (standard API key works reliably)
+            if self._openai_key:
                 return await self._call_openai(prompt, market.id, headlines)
+            elif self._anthropic_key:
+                return await self._call_anthropic(prompt, market.id, headlines)
         except Exception as e:
             logger.warning(f"LLM call failed: {e}")
 
@@ -211,7 +212,7 @@ Respond in JSON format ONLY:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-haiku-4-5-20250315",
+                "model": "claude-haiku-4-5-20250414",
                 "max_tokens": 256,
                 "messages": [{"role": "user", "content": prompt}],
             },
