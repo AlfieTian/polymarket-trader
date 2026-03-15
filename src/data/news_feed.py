@@ -192,11 +192,11 @@ Respond in JSON format ONLY:
 {{"probability": 0.XX, "confidence": 0.XX, "reasoning": "..."}}"""
 
         try:
-            # Prefer Anthropic Sonnet (smarter analysis)
-            if self._anthropic_key:
-                return await self._call_anthropic(prompt, market.id, headlines)
-            elif self._openai_key:
+            # Use OpenAI o4-mini (Anthropic OAuth token not compatible with direct REST API)
+            if self._openai_key:
                 return await self._call_openai(prompt, market.id, headlines)
+            elif self._anthropic_key:
+                return await self._call_anthropic(prompt, market.id, headlines)
         except Exception as e:
             logger.warning(f"LLM call failed: {e}")
 
