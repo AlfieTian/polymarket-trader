@@ -22,11 +22,6 @@ class OrderSide(str, Enum):
     SELL = "SELL"
 
 
-class OrderType(str, Enum):
-    LIMIT = "LIMIT"
-    MARKET = "MARKET"
-
-
 class OrderStatus(str, Enum):
     PENDING = "PENDING"
     OPEN = "OPEN"
@@ -38,19 +33,15 @@ class OrderStatus(str, Enum):
 
 @dataclass
 class Order:
-    """Represents a single order."""
-
     order_id: str
     token_id: str
     side: OrderSide
-    order_type: OrderType
     price: float
     size: float
     status: OrderStatus = OrderStatus.PENDING
     filled_size: float = 0.0
     filled_avg_price: float = 0.0
     created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
     dry_run: bool = False
 
     @property
@@ -63,116 +54,108 @@ class Order:
 
 
 class CLOBExecutor:
-    """Polymarket CLOB order execution engine.
-
-    Handles order placement, cancellation, and lifecycle management.
-    Dry-run mode logs orders without sending them to the exchange.
-    """
+    """Polymarket CLOB executor with full BUY/SELL support, tick_size, neg_risk."""
 
     def __init__(
         self,
         clob_url: str = "https://clob.polymarket.com",
-        api_key: str = "",
         private_key: str = "",
+        api_key: str = "",
+        api_secret: str = "",
+        api_passphrase: str = "",
+        wallet_address: str = "",
         dry_run: bool = True,
     ):
         self.clob_url = clob_url
-        self.api_key = api_key
         self.private_key = private_key
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.api_passphrase = api_passphrase
+        self.wallet_address = wallet_address
         self.dry_run = dry_run
         self._orders: dict[str, Order] = {}
-        self._client: httpx.AsyncClient | None = None
+        self._clob_client = None
+        # Cache: condition_id → {tick_size, neg_risk}
+        self._market_meta: dict[str, dict] = {}
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            headers = {}
-            if self.api_key:
-                headers["POLY_API_KEY"] = self.api_key
-            self._client = httpx.AsyncClient(
-                base_url=self.clob_url,
-                headers=headers,
-                timeout=httpx.Timeout(30.0),
+    def _init_clob_client(self):
+        if self._clob_client is not None:
+            return
+        if not self.private_key:
+            return
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds
+
+            creds = ApiCreds(
+                api_key=self.api_key,
+                api_secret=self.api_secret,
+                api_passphrase=self.api_passphrase,
             )
-        return self._client
+            self._clob_client = ClobClient(
+                host=self.clob_url,
+                key=self.private_key,
+                chain_id=137,
+                creds=creds,
+                signature_type=0,
+                funder=self.wallet_address,
+            )
+            logger.info("✅ CLOB client initialized")
+        except Exception as e:
+            logger.error(f"Failed to init CLOB client: {e}")
 
-    def estimate_slippage(
-        self,
-        orderbook_bids: list[dict],
-        orderbook_asks: list[dict],
-        side: OrderSide,
-        size: float,
-    ) -> dict:
-        """Estimate execution slippage based on order book depth.
+    def fetch_market_meta(self, condition_id: str) -> dict:
+        """Fetch tick_size and neg_risk for a market (cached)."""
+        if condition_id in self._market_meta:
+            return self._market_meta[condition_id]
 
-        Args:
-            orderbook_bids: List of {"price": float, "size": float}
-            orderbook_asks: List of {"price": float, "size": float}
-            side: BUY or SELL
-            size: Order size in shares
+        self._init_clob_client()
+        if not self._clob_client:
+            return {"tick_size": "0.01", "neg_risk": False}
 
-        Returns:
-            Dict with estimated avg_price, slippage_bps, and feasible flag
-        """
-        book = orderbook_asks if side == OrderSide.BUY else orderbook_bids
-        if not book:
-            return {"avg_price": 0, "slippage_bps": 0, "feasible": False}
-
-        remaining = size
-        total_cost = 0.0
-        mid_price = (
-            (orderbook_bids[0]["price"] + orderbook_asks[0]["price"]) / 2
-            if orderbook_bids and orderbook_asks
-            else book[0]["price"]
-        )
-
-        for level in book:
-            fill = min(remaining, level["size"])
-            total_cost += fill * level["price"]
-            remaining -= fill
-            if remaining <= 0:
-                break
-
-        if remaining > 0:
-            return {
-                "avg_price": total_cost / (size - remaining) if size > remaining else 0,
-                "slippage_bps": 0,
-                "feasible": False,
-                "unfilled": remaining,
+        try:
+            meta = self._clob_client.get_market(condition_id)
+            result = {
+                "tick_size": str(meta.get("minimum_tick_size", "0.01")),
+                "neg_risk": bool(meta.get("neg_risk", False)),
             }
+            self._market_meta[condition_id] = result
+            return result
+        except Exception as e:
+            logger.warning(f"Could not fetch market meta for {condition_id}: {e}, using defaults")
+            return {"tick_size": "0.01", "neg_risk": False}
 
-        avg_price = total_cost / size
-        slippage_bps = abs(avg_price - mid_price) / mid_price * 10000
+    def _snap_price(self, price: float, tick_size: str) -> float:
+        """Snap price to valid tick size increment."""
+        tick = float(tick_size)
+        snapped = round(round(price / tick) * tick, 4)
+        return max(tick, min(1 - tick, snapped))
 
-        return {
-            "avg_price": avg_price,
-            "slippage_bps": slippage_bps,
-            "feasible": True,
-        }
-
-    async def place_limit_order(
+    def place_order(
         self,
         token_id: str,
         side: OrderSide,
         price: float,
         size: float,
+        condition_id: str = "",
     ) -> Order:
         """Place a limit order on the CLOB.
 
         Args:
-            token_id: Token to trade
+            token_id: YES or NO token ID to trade
             side: BUY or SELL
             price: Limit price (0-1)
             size: Number of shares
+            condition_id: Market condition ID (needed for tick_size/neg_risk)
 
         Returns:
-            Order object with status
+            Order object
         """
         order_id = str(uuid.uuid4())[:8]
         order = Order(
             order_id=order_id,
             token_id=token_id,
             side=side,
-            order_type=OrderType.LIMIT,
             price=price,
             size=size,
             dry_run=self.dry_run,
@@ -182,108 +165,99 @@ class CLOBExecutor:
             order.status = OrderStatus.OPEN
             self._orders[order_id] = order
             logger.info(
-                f"[DRY RUN] Limit {side.value} {size:.2f} shares of {token_id} "
-                f"@ ${price:.4f} — order_id={order_id}"
+                f"[DRY RUN] {side.value} {size:.2f} shares @ ${price:.3f} "
+                f"token={token_id[:12]}..."
             )
             return order
 
-        # Live execution
+        self._init_clob_client()
+        if not self._clob_client:
+            order.status = OrderStatus.FAILED
+            return order
+
         try:
-            client = await self._get_client()
-            payload = {
-                "tokenID": token_id,
-                "side": side.value,
-                "price": str(price),
-                "size": str(size),
-                "type": "LIMIT",
-            }
-            resp = await client.post("/order", json=payload)
-            resp.raise_for_status()
-            result = resp.json()
+            from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+            from py_clob_client.order_builder.constants import BUY, SELL
+
+            # Get tick_size and neg_risk
+            meta = self.fetch_market_meta(condition_id) if condition_id else {"tick_size": "0.01", "neg_risk": False}
+            snapped_price = self._snap_price(price, meta["tick_size"])
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=snapped_price,
+                size=round(size, 2),
+                side=BUY if side == OrderSide.BUY else SELL,
+            )
+            options = PartialCreateOrderOptions(
+                tick_size=meta["tick_size"],
+                neg_risk=meta["neg_risk"],
+            )
+
+            result = self._clob_client.create_and_post_order(order_args, options)
 
             order.order_id = result.get("orderID", order_id)
             order.status = OrderStatus.OPEN
             self._orders[order.order_id] = order
 
             logger.info(
-                f"Placed limit {side.value} {size:.2f} @ ${price:.4f} "
+                f"✅ {side.value} {size:.2f} @ ${snapped_price:.3f} "
                 f"— order_id={order.order_id}"
             )
         except Exception as e:
             order.status = OrderStatus.FAILED
-            logger.error(f"Failed to place order: {e}")
+            logger.error(f"❌ Order failed: {e}")
 
         return order
 
-    async def place_market_order(
-        self,
-        token_id: str,
-        side: OrderSide,
-        size: float,
-    ) -> Order:
-        """Place a market order (aggressive limit at best ask/bid).
-
-        Args:
-            token_id: Token to trade
-            side: BUY or SELL
-            size: Number of shares
-
-        Returns:
-            Order object
-        """
-        # Market orders = aggressive limit at 0.99 (buy) or 0.01 (sell)
-        price = 0.99 if side == OrderSide.BUY else 0.01
-        return await self.place_limit_order(token_id, side, price, size)
-
-    async def cancel_order(self, order_id: str) -> bool:
-        """Cancel an open order.
-
-        Args:
-            order_id: Order to cancel
-
-        Returns:
-            True if cancelled successfully
-        """
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order."""
         order = self._orders.get(order_id)
-        if not order:
-            logger.warning(f"Order {order_id} not found")
-            return False
-
-        if not order.is_active:
-            logger.warning(f"Order {order_id} is not active (status={order.status})")
+        if not order or not order.is_active:
             return False
 
         if self.dry_run:
             order.status = OrderStatus.CANCELLED
-            order.updated_at = time.time()
-            logger.info(f"[DRY RUN] Cancelled order {order_id}")
+            logger.info(f"[DRY RUN] Cancelled {order_id}")
             return True
 
-        try:
-            client = await self._get_client()
-            resp = await client.delete(f"/order/{order_id}")
-            resp.raise_for_status()
-            order.status = OrderStatus.CANCELLED
-            order.updated_at = time.time()
-            logger.info(f"Cancelled order {order_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to cancel order {order_id}: {e}")
+        self._init_clob_client()
+        if not self._clob_client:
             return False
 
+        try:
+            self._clob_client.cancel(order_id)
+            order.status = OrderStatus.CANCELLED
+            logger.info(f"✅ Cancelled {order_id}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Cancel failed: {e}")
+            return False
+
+    def cancel_all(self) -> int:
+        """Cancel all open orders."""
+        if self.dry_run:
+            count = sum(1 for o in self._orders.values() if o.is_active)
+            for o in self._orders.values():
+                if o.is_active:
+                    o.status = OrderStatus.CANCELLED
+            logger.info(f"[DRY RUN] Cancelled {count} orders")
+            return count
+
+        self._init_clob_client()
+        if not self._clob_client:
+            return 0
+
+        try:
+            self._clob_client.cancel_all()
+            count = sum(1 for o in self._orders.values() if o.is_active)
+            for o in self._orders.values():
+                if o.is_active:
+                    o.status = OrderStatus.CANCELLED
+            return count
+        except Exception as e:
+            logger.error(f"❌ Cancel all failed: {e}")
+            return 0
+
     def get_open_orders(self) -> list[Order]:
-        """Get all currently active orders."""
         return [o for o in self._orders.values() if o.is_active]
-
-    async def cancel_all(self) -> int:
-        """Cancel all open orders. Returns count cancelled."""
-        open_orders = self.get_open_orders()
-        cancelled = 0
-        for order in open_orders:
-            if await self.cancel_order(order.order_id):
-                cancelled += 1
-        return cancelled
-
-    async def close(self) -> None:
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()

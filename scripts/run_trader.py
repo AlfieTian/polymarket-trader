@@ -2,31 +2,32 @@
 """
 Polymarket Trader — Main Entry Point
 
-使用方法：
-  1. cp .env.template .env && 填入 POLYMARKET_PRIVATE_KEY
-  2. python scripts/setup_api_key.py  (自动生成 API 凭证)
-  3. python scripts/run_trader.py     (默认 dry-run 安全模式)
-
-Async event loop:
-  Fetch markets → Bayesian update → Detect edge → Kelly sizing → Risk check → Execute
+Async loop:
+  Fetch markets → Bayesian update (LLM news signals) → Detect edge →
+  Kelly sizing → Risk check → Execute BUY → Track positions → Execute SELL on exit
 """
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 from src.data.news_feed import NewsFeed
 from src.data.polymarket_client import PolymarketClient
+from src.execution.clob_executor import CLOBExecutor, OrderSide
+from src.execution.position_manager import Position, PositionManager
 from src.risk.risk_manager import RiskManager
 from src.signals.bayesian_engine import BayesianEngine
 from src.strategy.edge_detector import EdgeDetector
@@ -48,7 +49,6 @@ def setup_logging(config: dict) -> None:
     log_file = log_config.get("file", "logs/trader.log")
     log_path = Path(__file__).parent.parent / log_file
     log_path.parent.mkdir(parents=True, exist_ok=True)
-
     logging.basicConfig(
         level=level,
         format="%(message)s",
@@ -61,22 +61,30 @@ def setup_logging(config: dict) -> None:
 
 
 class Trader:
-    """Main trading orchestrator."""
-
     def __init__(self, config: dict):
         self.config = config
-
         pm_cfg = config.get("polymarket", {})
         strat_cfg = config.get("strategy", {})
         bay_cfg = config.get("bayesian", {})
         risk_cfg = config.get("risk", {})
+        pos_cfg = config.get("position", {})
 
-        self.client = PolymarketClient(
-            dry_run=pm_cfg.get("dry_run", True),
+        self.dry_run = pm_cfg.get("dry_run", True)
+
+        self.client = PolymarketClient(dry_run=self.dry_run)
+
+        self.executor = CLOBExecutor(
+            clob_url="https://clob.polymarket.com",
+            private_key=os.getenv("POLYMARKET_PRIVATE_KEY", ""),
+            api_key=os.getenv("POLYMARKET_API_KEY", ""),
+            api_secret=os.getenv("POLYMARKET_API_SECRET", ""),
+            api_passphrase=os.getenv("POLYMARKET_API_PASSPHRASE", ""),
+            wallet_address=os.getenv("POLYMARKET_WALLET_ADDRESS", ""),
+            dry_run=self.dry_run,
         )
 
         self.bayesian = BayesianEngine(
-            prior_weight=bay_cfg.get("prior_weight", 0.7),
+            prior_weight=bay_cfg.get("prior_weight", 0.95),
             min_observations=bay_cfg.get("min_observations", 3),
         )
 
@@ -97,28 +105,34 @@ class Trader:
             max_market_concentration=risk_cfg.get("max_market_concentration", 0.3),
         )
 
+        self.positions = PositionManager(
+            profit_target_pct=pos_cfg.get("profit_target_pct", 0.30),
+            stop_loss_pct=pos_cfg.get("stop_loss_pct", 0.40),
+            pre_resolution_hours=pos_cfg.get("pre_resolution_hours", 2.0),
+            min_edge_to_hold=pos_cfg.get("min_edge_to_hold", 0.02),
+        )
+
         self.news_feed = NewsFeed()
         self.loop_interval = config.get("trading", {}).get("loop_interval_s", 60)
         self._running = False
 
     async def run_cycle(self) -> None:
-        """Execute one trading cycle."""
         t0 = time.perf_counter()
 
+        # ─── 1. Fetch markets ─────────────────────────────────
         markets = await self.client.get_markets(limit=50, min_volume=1000)
-        logger.info(f"📊 Fetched {len(markets)} markets")
-
-        # Filter to tradeable price range (10%-90%)
         tradeable = [m for m in markets if 0.10 <= m.yes_price <= 0.90]
-        logger.info(f"   Tradeable (10%-90% price range): {len(tradeable)}/{len(markets)}")
+        logger.info(f"📊 {len(markets)} markets → {len(tradeable)} tradeable (10-90%)")
 
+        # ─── 2. Update beliefs + detect edges ─────────────────
         scan_data = []
+        market_map = {m.id: m for m in tradeable}
+
         for market in tradeable:
             belief = self.bayesian.get_belief(market.id)
             if belief is None:
                 self.bayesian.init_belief(market.id, market.yes_price)
 
-            # Fetch and apply LLM news signals for this market
             news_signals = await self.news_feed.get_llm_signals(market)
             if news_signals:
                 self.bayesian.batch_update(market.id, news_signals)
@@ -134,64 +148,139 @@ class Trader:
                 "confidence": 1.0,
             })
 
+        # ─── 3. Check existing positions for exits ────────────
+        current_prices = {m.id: m.yes_price for m in tradeable}
+        current_p_hats = {d["market_id"]: d["p_hat"] for d in scan_data}
+        exit_signals = self.positions.check_exits(current_prices, current_p_hats)
+
+        for exit_sig in exit_signals:
+            pos = exit_sig.position
+            await self._execute_exit(pos, exit_sig.current_price, market_map, exit_sig.reason.value)
+
+        # ─── 4. Find new opportunities ─────────────────────────
         opportunities = self.edge_detector.scan_markets(scan_data)
 
         if not opportunities:
             logger.info("😴 No edge this cycle")
-            return
+        else:
+            for opp in opportunities:
+                # Skip if already have a position in this market
+                if self.positions.get_position(opp.market_id):
+                    continue
 
-        for opp in opportunities:
-            if not self.bayesian.is_tradeable(opp.market_id):
-                continue
+                if not self.bayesian.is_tradeable(opp.market_id):
+                    continue
 
-            bankroll = self.kelly.remaining_capacity
-            pos = self.kelly.calculate(
-                market_id=opp.market_id,
-                side=opp.side,
-                p_hat=opp.p_hat,
-                market_price=opp.market_price,
-                bankroll=bankroll,
+                # Kelly sizing
+                bankroll = self.kelly.remaining_capacity
+                pos_size = self.kelly.calculate(
+                    market_id=opp.market_id,
+                    side=opp.side,
+                    p_hat=opp.p_hat,
+                    market_price=opp.market_price,
+                    bankroll=bankroll,
+                )
+                if pos_size.position_usdc <= 0:
+                    continue
+
+                # Risk check
+                risk_check = self.risk.validate_trade(opp.market_id, pos_size.position_usdc)
+                if not risk_check.approved:
+                    logger.warning(f"❌ Risk rejected {opp.market_id}: {risk_check.reason}")
+                    continue
+
+                # Execute entry
+                await self._execute_entry(opp, pos_size.position_usdc, market_map)
+
+        # ─── 5. Portfolio summary ──────────────────────────────
+        summary = self.positions.summary()
+        if summary["open_positions"] > 0:
+            logger.info(
+                f"📂 Portfolio: {summary['open_positions']} positions, "
+                f"${summary['total_exposure_usdc']:.2f} exposure"
             )
-
-            if pos.position_usdc <= 0:
-                continue
-
-            risk_check = self.risk.validate_trade(opp.market_id, pos.position_usdc)
-            if not risk_check.approved:
-                logger.warning(f"❌ Risk rejected: {risk_check.reason}")
-                continue
-
-            # Find token
-            market = next(m for m in markets if m.id == opp.market_id)
-            token_id = market.yes_token_id if opp.side == "YES" else market.no_token_id
-            shares = pos.position_usdc / opp.market_price if opp.market_price > 0 else 0
-
-            # Execute via SDK
-            result = self.client.place_order(
-                token_id=token_id,
-                side="BUY",
-                price=round(opp.market_price, 2),
-                size=round(shares, 1),
-            )
-
-            self.risk.record_position(opp.market_id, pos.position_usdc)
-            self.kelly.record_position(opp.market_id, pos.position_usdc)
-            self._print_trade(opp, pos, result)
 
         elapsed = time.perf_counter() - t0
         logger.info(f"⏱️ Cycle in {elapsed:.2f}s")
 
-    def _print_trade(self, opp, pos, result) -> None:
-        table = Table(title="📈 Trade", show_header=False)
-        table.add_row("Market", opp.market_question[:60])
-        table.add_row("Side", opp.side)
+    async def _execute_entry(self, opp, size_usdc: float, market_map: dict) -> None:
+        """Execute a BUY order for a detected edge."""
+        market = market_map.get(opp.market_id)
+        if not market:
+            return
+
+        # Correct token and side based on YES/NO direction
+        if opp.side == "YES":
+            token_id = market.yes_token_id
+            entry_price = market.yes_price
+        else:
+            token_id = market.no_token_id
+            entry_price = 1.0 - market.yes_price
+
+        shares = size_usdc / entry_price if entry_price > 0 else 0
+        if shares <= 0:
+            return
+
+        order = self.executor.place_order(
+            token_id=token_id,
+            side=OrderSide.BUY,
+            price=entry_price,
+            size=shares,
+            condition_id=market.condition_id,
+        )
+
+        if order.status.value not in ("FAILED",):
+            # Record position
+            position = Position(
+                market_id=opp.market_id,
+                condition_id=market.condition_id,
+                token_id=token_id,
+                side=opp.side,
+                entry_price=entry_price,
+                size=shares,
+                size_usdc=size_usdc,
+                p_hat_at_entry=opp.p_hat,
+                market_price_at_entry=opp.market_price,
+                end_date=market.end_date,
+            )
+            self.positions.add_position(position)
+            self.risk.record_position(opp.market_id, size_usdc)
+            self.kelly.record_position(opp.market_id, size_usdc)
+
+            self._print_entry(opp, entry_price, shares, size_usdc, order)
+
+    async def _execute_exit(self, pos: Position, current_price: float, market_map: dict, reason: str) -> None:
+        """Execute a SELL order to close a position."""
+        order = self.executor.place_order(
+            token_id=pos.token_id,
+            side=OrderSide.SELL,
+            price=current_price,
+            size=pos.size,
+            condition_id=pos.condition_id,
+        )
+
+        pnl = (current_price - pos.entry_price) * pos.size
+        self.risk.record_pnl(pnl)
+        self.positions.close_position(pos.market_id)
+        self.risk.close_position(pos.market_id)
+        self.kelly.close_position(pos.market_id)
+
+        logger.info(
+            f"🚪 Closed {pos.market_id} {pos.side} [{reason}] — "
+            f"PnL: ${pnl:+.2f} | "
+            f"entry=${pos.entry_price:.3f} exit=${current_price:.3f}"
+        )
+
+    def _print_entry(self, opp, entry_price, shares, size_usdc, order) -> None:
+        table = Table(title="📈 Entry", show_header=False, box=None)
+        table.add_row("Market", opp.market_question[:55])
+        table.add_row("Side", f"BUY {opp.side}")
         table.add_row("Edge", f"{opp.edge:+.4f} ({opp.edge_pct})")
-        table.add_row("p̂", f"{opp.p_hat:.4f}")
-        table.add_row("Market", f"{opp.market_price:.4f}")
-        table.add_row("Kelly", f"{pos.kelly_full:.4f} × {pos.kelly_fraction_used}")
-        table.add_row("Size", f"${pos.position_usdc:.2f}")
-        table.add_row("Order", str(result.get("orderID", result.get("order_id", "?")))[:16])
-        table.add_row("Mode", "🔵 DRY RUN" if self.client.dry_run else "🟢 LIVE")
+        table.add_row("p̂ / market", f"{opp.p_hat:.4f} / {opp.market_price:.4f}")
+        table.add_row("Entry price", f"${entry_price:.3f}")
+        table.add_row("Shares", f"{shares:.2f}")
+        table.add_row("Size", f"${size_usdc:.2f} USDC")
+        table.add_row("Mode", "🔵 DRY RUN" if self.dry_run else "🟢 LIVE")
         console.print(table)
 
     async def run(self) -> None:
@@ -201,11 +290,14 @@ class Trader:
             loop.add_signal_handler(sig, self._shutdown)
 
         console.print("\n[bold green]🚀 Polymarket Trader[/bold green]")
-        console.print(f"  Mode: {'🔵 MOCK' if self.client.mock else '🟢 LIVE'}")
-        console.print(f"  Dry run: {self.client.dry_run}")
-        console.print(f"  Kelly: {self.kelly.kelly_fraction}x")
-        console.print(f"  Min edge: {self.edge_detector.min_edge}")
-        console.print(f"  Interval: {self.loop_interval}s\n")
+        console.print(f"  Mode:      {'🔵 MOCK' if self.client.mock else '🟢 LIVE DATA'}")
+        console.print(f"  Dry run:   {self.dry_run} {'(no real orders)' if self.dry_run else '⚡ REAL ORDERS'}")
+        console.print(f"  Kelly:     {self.kelly.kelly_fraction}x")
+        console.print(f"  Min edge:  {self.edge_detector.min_edge}")
+        console.print(f"  Interval:  {self.loop_interval}s")
+        console.print(f"  Exit:      profit +{self.positions.profit_target_pct:.0%} / "
+                      f"stop -{self.positions.stop_loss_pct:.0%} / "
+                      f"{self.positions.pre_resolution_hours:.0f}h before resolution\n")
 
         while self._running:
             try:
@@ -215,7 +307,7 @@ class Trader:
             if self._running:
                 await asyncio.sleep(self.loop_interval)
 
-        self.client.cancel_all_orders()
+        self.executor.cancel_all()
         await self.client.close()
         console.print("[bold red]🛑 Stopped[/bold red]")
 

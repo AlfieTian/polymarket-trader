@@ -19,6 +19,12 @@ risk:
 lmsr:
   b: 100000
 
+position:
+  profit_target_pct: 0.30    # 价格向有利方向移动30%时平仓
+  stop_loss_pct: 0.40         # 亏损40%时止损
+  pre_resolution_hours: 2.0  # 结果公布前2小时强制平仓
+  min_edge_to_hold: 0.02     # edge降至2%以下时平仓（模型不再支持持仓）
+
 trading:
   loop_interval_s: 60
 
