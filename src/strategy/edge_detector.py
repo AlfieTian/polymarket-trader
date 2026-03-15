@@ -49,7 +49,9 @@ class EdgeDetector:
         min_volume_24h: float = 0.0,
         min_confidence: float = 0.0,
         min_time_to_resolution_hours: float = 1.0,
+        price_bounds: tuple[float, float] = (0.05, 0.95),
     ):
+        self.price_bounds = price_bounds
         self.min_edge = min_edge
         self.min_volume_24h = min_volume_24h
         self.min_confidence = min_confidence
@@ -79,6 +81,11 @@ class EdgeDetector:
         Returns:
             TradeOpportunity if edge detected, None otherwise
         """
+        # Skip extreme prices (already settled or near-certain markets)
+        lo, hi = self.price_bounds
+        if market_price_yes <= lo or market_price_yes >= hi:
+            return None
+
         # Calculate edge for YES side
         edge_yes = p_hat - market_price_yes
         # Calculate edge for NO side

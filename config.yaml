@@ -1,9 +1,6 @@
 polymarket:
-  api_key: ""
-  private_key: ""
-  clob_url: "https://clob.polymarket.com"
-  rest_url: "https://gamma-api.polymarket.com"
-  dry_run: true
+  # 凭证从 .env 自动加载，这里不需要填
+  dry_run: true  # ⚠️ 未经 Alfie 授权不得改为 false
 
 bayesian:
   prior_weight: 0.7
