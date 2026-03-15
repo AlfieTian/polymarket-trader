@@ -231,8 +231,9 @@ Respond in JSON format ONLY:
                 "Content-type": "application/json",
             },
             json={
-                "model": "gpt-4o-mini",
-                "max_tokens": 256,
+                # o4-mini: 10M tokens/day free, strong reasoning for probability estimation
+                "model": "o4-mini",
+                "max_completion_tokens": 512,
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
