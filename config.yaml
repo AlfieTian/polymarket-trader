@@ -3,7 +3,7 @@ polymarket:
   dry_run: true  # ⚠️ 未经 Alfie 授权不得改为 false
 
 bayesian:
-  prior_weight: 0.7
+  prior_weight: 0.95  # 几乎完全信任市场价作为先验，只有LLM有强信号时才产生edge
   min_observations: 3
 
 strategy:
