@@ -105,18 +105,24 @@ class Trader:
         """Execute one trading cycle."""
         t0 = time.perf_counter()
 
-        markets = await self.client.get_markets(limit=20)
+        markets = await self.client.get_markets(limit=50, min_volume=1000)
         logger.info(f"📊 Fetched {len(markets)} markets")
 
+        # Filter to tradeable price range (10%-90%)
+        tradeable = [m for m in markets if 0.10 <= m.yes_price <= 0.90]
+        logger.info(f"   Tradeable (10%-90% price range): {len(tradeable)}/{len(markets)}")
+
         scan_data = []
-        for market in markets:
+        for market in tradeable:
             belief = self.bayesian.get_belief(market.id)
             if belief is None:
                 self.bayesian.init_belief(market.id, market.yes_price)
 
-            signals = self.news_feed.get_signals()
-            if signals:
-                self.bayesian.batch_update(market.id, signals)
+            # Fetch and apply LLM news signals for this market
+            news_signals = await self.news_feed.get_llm_signals(market)
+            if news_signals:
+                self.bayesian.batch_update(market.id, news_signals)
+                logger.info(f"   🧠 {market.id}: {len(news_signals)} LLM signals applied")
 
             belief = self.bayesian.get_belief(market.id)
             scan_data.append({
