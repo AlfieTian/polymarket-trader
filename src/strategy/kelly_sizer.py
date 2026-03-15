@@ -180,3 +180,7 @@ class KellySizer:
     def close_position(self, market_id: str) -> None:
         """Remove a market from exposure tracking."""
         self._current_exposure.pop(market_id, None)
+
+    def reset_positions(self) -> None:
+        """Clear exposure tracking so it can be rebuilt from persisted positions."""
+        self._current_exposure.clear()

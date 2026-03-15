@@ -76,13 +76,18 @@ class NewsFeed:
     def __init__(self):
         self._items: list[NewsItem] = []
         self._llm_cache: dict[str, LLMAnalysis] = {}
-        self._cache_ttl = 300  # 5 min cache per market
+        self._cache_ttl = 1800  # 30 min cache per market (prediction markets are slow-moving)
         self._http: httpx.AsyncClient | None = None
 
         # API keys for news + LLM
         self._brave_api_key = os.getenv("BRAVE_API_KEY", "")
         self._anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
         self._openai_key = os.getenv("OPENAI_API_KEY", "")
+
+        # Track which analysis version was last applied to the Bayesian engine.
+        # Prevents the same cached analysis from being re-applied every cycle,
+        # which would cause belief drift and push p̂ to extreme values (0.05/0.95).
+        self._applied_cache: dict[str, float] = {}  # market_id -> analysis.timestamp
 
         if self._brave_api_key:
             logger.info("📰 Brave Search API available for news")
@@ -110,10 +115,18 @@ class NewsFeed:
         Returns:
             List of Signal objects (empty if no APIs or cached)
         """
-        # Check cache
+        # Check cache — only apply each analysis ONCE to avoid belief drift.
+        # Re-applying the same signal every 15s cycle would push p̂ to 0.05/0.95
+        # extremes (signal accumulation bug), causing false large-edge detections.
         cached = self._llm_cache.get(market.id)
         if cached and (time.time() - cached.timestamp) < self._cache_ttl:
-            return []  # Already applied recently, skip
+            if self._applied_cache.get(market.id) == cached.timestamp:
+                # Already applied this analysis in a previous cycle — skip
+                return []
+            # First time applying this cache entry
+            self._applied_cache[market.id] = cached.timestamp
+            signal = self._analysis_to_signal(cached, market.yes_price)
+            return [signal] if signal else []
 
         # Need at least LLM API
         if not (self._anthropic_key or self._openai_key):
@@ -129,6 +142,7 @@ class NewsFeed:
                 return []
 
             self._llm_cache[market.id] = analysis
+            self._applied_cache[market.id] = analysis.timestamp  # mark as applied
 
             # Step 3: Convert to Bayesian signal
             signal = self._analysis_to_signal(analysis, market.yes_price)
@@ -144,32 +158,91 @@ class NewsFeed:
 
         return []
 
-    async def _search_news(self, query: str, count: int = 5) -> list[str]:
-        """Search recent news headlines related to the query."""
-        if not self._brave_api_key:
-            return []
+    # ─── RSS sources (free, no API key) ─────────────────────
+    RSS_FEEDS = [
+        "https://feeds.reuters.com/Reuters/worldNews",
+        "https://feeds.reuters.com/reuters/topNews",
+        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://feeds.skynews.com/feeds/rss/world.xml",
+    ]
 
+    async def _fetch_rss(self, feed_url: str) -> list[str]:
+        """Fetch and parse a single RSS feed, return list of title+description strings."""
         try:
             client = await self._get_http()
-            resp = await client.get(
-                "https://api.search.brave.com/res/v1/news/search",
-                params={"q": query, "count": count, "freshness": "pd"},
-                headers={"X-Subscription-Token": self._brave_api_key},
-            )
+            resp = await client.get(feed_url, follow_redirects=True,
+                                    headers={"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"})
             resp.raise_for_status()
-            data = resp.json()
-
-            headlines = []
-            for result in data.get("results", []):
-                title = result.get("title", "")
-                desc = result.get("description", "")
-                headlines.append(f"{title}: {desc[:200]}")
-
-            return headlines
-
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(resp.text)
+            items = []
+            for item in root.iter("item"):
+                title = (item.findtext("title") or "").strip()
+                desc = (item.findtext("description") or "").strip()[:200]
+                if title:
+                    items.append(f"{title}: {desc}" if desc else title)
+            return items[:10]
         except Exception as e:
-            logger.debug(f"News search failed: {e}")
+            logger.debug(f"RSS fetch failed ({feed_url}): {e}")
             return []
+
+    async def _search_news(self, query: str, count: int = 5) -> list[str]:
+        """Search recent news headlines related to the query.
+
+        Strategy:
+        1. Fetch 3 RSS feeds in parallel (free, unlimited)
+        2. Filter by keyword relevance to the query
+        3. Fall back to Brave only if no RSS results (and API key exists)
+        """
+        keywords = {w.lower() for w in query.split() if len(w) > 3}
+
+        # Parallel RSS fetch
+        feeds_to_try = self.RSS_FEEDS[:3]  # only 3 feeds to keep latency low
+        raw_results = await asyncio.gather(
+            *[self._fetch_rss(url) for url in feeds_to_try],
+            return_exceptions=True,
+        )
+        all_items: list[str] = []
+        for r in raw_results:
+            if isinstance(r, list):
+                all_items.extend(r)
+
+        # Score by keyword overlap
+        def _score(headline: str) -> int:
+            hl = headline.lower()
+            return sum(1 for kw in keywords if kw in hl)
+
+        relevant = sorted(all_items, key=_score, reverse=True)
+        top = [h for h in relevant if _score(h) > 0][:count]
+
+        if top:
+            logger.debug(f"📰 RSS: {len(top)} relevant headlines for query")
+            return top
+
+        # Fallback: Brave (only if key present and RSS came up empty)
+        if self._brave_api_key:
+            try:
+                client = await self._get_http()
+                resp = await client.get(
+                    "https://api.search.brave.com/res/v1/news/search",
+                    params={"q": query, "count": count, "freshness": "pd"},
+                    headers={"X-Subscription-Token": self._brave_api_key},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                headlines = []
+                for result in data.get("results", []):
+                    title = result.get("title", "")
+                    desc = result.get("description", "")
+                    headlines.append(f"{title}: {desc[:200]}")
+                logger.debug(f"📰 Brave fallback: {len(headlines)} headlines")
+                return headlines
+            except Exception as e:
+                logger.debug(f"Brave fallback failed: {e}")
+
+        return []
 
     async def _analyze_with_llm(self, market, headlines: list[str]) -> LLMAnalysis | None:
         """Use LLM to estimate probability for a market question."""
@@ -261,9 +334,9 @@ Respond in JSON format ONLY:
             conf = float(result["confidence"])
             reasoning = str(result.get("reasoning", ""))
 
-            # Sanity check
-            prob = np.clip(prob, 0.01, 0.99)
-            conf = np.clip(conf, 0.0, 1.0)
+            # Sanity check — cap extremes so LLM overconfidence can't drive p̂ to 0/1
+            prob = np.clip(prob, 0.05, 0.95)
+            conf = np.clip(conf, 0.0, 0.80)   # hard cap: LLM is never >80% confident
 
             return LLMAnalysis(
                 market_id=market_id,
@@ -285,16 +358,21 @@ Respond in JSON format ONLY:
         if diff < 0.02:  # LLM agrees with market, no signal
             return None
 
-        # Use LLM probability estimate as likelihood
+        # Use LLM probability estimate as likelihood.
+        # Note: confidence is already conservatively capped at 0.80 in _parse_llm_response.
+        # Do NOT apply an additional * 0.6 discount here — that would make the maximum
+        # achievable signal confidence = 0.48 < min_confidence threshold of 0.50,
+        # making it mathematically IMPOSSIBLE to ever execute a trade (Bug #002).
         return Signal(
             signal_type=SignalType.EXPERT_FORECAST,
             likelihood_yes=analysis.estimated_probability,
             likelihood_no=1 - analysis.estimated_probability,
-            confidence=analysis.confidence * 0.6,  # discount LLM confidence
+            confidence=analysis.confidence,  # capped at 0.80 by _parse_llm_response
             metadata={
                 "source": "llm_analysis",
                 "reasoning": analysis.reasoning,
                 "n_headlines": len(analysis.news_headlines),
+                "raw_confidence": analysis.confidence,  # for debugging/auditing
             },
         )
 

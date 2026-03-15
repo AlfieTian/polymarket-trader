@@ -71,8 +71,8 @@ class BeliefState:
 
     @property
     def p_hat(self) -> float:
-        """Alias for p_yes — our estimated true probability."""
-        return self.p_yes
+        """Alias for p_yes — clamped to [0.05, 0.95] to prevent runaway posteriors."""
+        return float(np.clip(self.p_yes, 0.05, 0.95))
 
 
 class BayesianEngine:

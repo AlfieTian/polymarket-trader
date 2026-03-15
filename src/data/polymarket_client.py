@@ -23,6 +23,35 @@ logger = logging.getLogger(__name__)
 _env_path = Path(__file__).parent.parent.parent / ".env"
 load_dotenv(_env_path)
 
+# ── Sports / Esports market ban ───────────────────────────────────────────────
+# Keywords matched case-insensitively against the market question.
+# If any keyword is found, the market is blocked from trading.
+_BANNED_KEYWORDS: list[str] = [
+    # Sports
+    "soccer", "football", "basketball", "tennis", "baseball", "hockey", "golf",
+    "nfl", "nba", "mlb", "nhl", "mls",
+    "premier league", "la liga", "bundesliga", "serie a", "ligue 1",
+    "champions league", "europa league", "world cup", "super bowl",
+    "match winner", "set winner", "game winner",
+    "bnp paribas", "australian open", "wimbledon", "us open", "roland garros",
+    "atp", "wta", "fifa", "ufc", "boxing", "mma", "wrestling",
+    "f1", "formula 1", "formula one", "tour de france", "olympics",
+    # Esports
+    "esports", "e-sports", "cs2", "counter-strike", "dota", "league of legends",
+    " lol ", "valorant", "overwatch", "csgo", "cs:go",
+    "esl", "blast", "iem", "pgl", "faceit", "hltv",
+    "natus vincere", "navi", " g2 ", "astralis", "faze", "team liquid",
+    "fnatic", "cloud9", " t1 ", "furia", "fut esports", "mouz",
+    "epl season", "esl pro league",
+]
+
+
+def is_banned_market(question: str) -> bool:
+    """Return True if the market question matches a banned sports/esports keyword."""
+    q = question.lower()
+    return any(kw in q for kw in _BANNED_KEYWORDS)
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 class MarketStatus(str, Enum):
     ACTIVE = "active"
@@ -216,15 +245,21 @@ class PolymarketClient:
             return []
 
         markets = []
+        banned_count = 0
         for item in data if isinstance(data, list) else []:
             try:
                 market = self._parse_market(item)
-                if market and market.volume_24h >= min_volume:
-                    markets.append(market)
+                if not market or market.volume_24h < min_volume:
+                    continue
+                if is_banned_market(market.question):
+                    logger.debug(f"🚫 Banned market (sports/esports): {market.question[:60]}")
+                    banned_count += 1
+                    continue
+                markets.append(market)
             except Exception as e:
                 logger.debug(f"Skipping unparseable market: {e}")
 
-        logger.info(f"📊 Fetched {len(markets)} markets from Polymarket")
+        logger.info(f"📊 Fetched {len(markets)} markets from Polymarket (skipped {banned_count} sports/esports)")
         return markets
 
     async def get_market(self, market_id: str) -> Market | None:
