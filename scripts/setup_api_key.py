@@ -66,6 +66,8 @@ def main():
         set_key(str(ENV_PATH), "POLYMARKET_API_KEY", api_key)
         set_key(str(ENV_PATH), "POLYMARKET_API_SECRET", api_secret)
         set_key(str(ENV_PATH), "POLYMARKET_API_PASSPHRASE", api_passphrase)
+        # Lock down permissions after write (0600)
+        os.chmod(ENV_PATH, 0o600)
 
         print(f"\n✅ 凭证已写入 {ENV_PATH}")
 

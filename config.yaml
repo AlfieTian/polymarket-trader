@@ -1,32 +1,39 @@
 polymarket:
   # 凭证从 .env 自动加载，这里不需要填
-  dry_run: true  # ⚠️ 未经 Alfie 授权不得改为 false
+  dry_run: false  # Live 模式，Alfie 授权于 2026-03-08
 
 bayesian:
   prior_weight: 0.95  # 几乎完全信任市场价作为先验，只有LLM有强信号时才产生edge
-  min_observations: 3
+  min_observations: 1
+  min_confidence: 0.5   # LLM平均置信度低于此值时不开仓（防止默认p̂=0.05乱下注）
 
 strategy:
-  min_edge: 0.03
+  min_edge: 0.05        # 提高到5%，减少噪声信号
   kelly_fraction: 0.25
-  max_position_usdc: 100
-  max_portfolio_usdc: 1000
+  max_position_usdc: 5  # 单笔最多 $5
+  max_portfolio_usdc: 29.00  # 充值后可用余额
 
 risk:
-  max_daily_loss_usdc: 200
-  max_market_concentration: 0.3
+  max_daily_loss_usdc: 5          # 每日最大亏损 $5
+  max_market_concentration: 0.3   # 单市场≤30%总资金
+  max_loss_per_market_usdc: 8     # 单市场累计已实现亏损超过 $8 则不再开仓
 
 lmsr:
   b: 100000
 
 position:
-  profit_target_pct: 0.30    # 价格向有利方向移动30%时平仓
-  stop_loss_pct: 0.40         # 亏损40%时止损
+  profit_target_pct: 0.18    # 价格向有利方向移动18%时止盈（减少反复进出摩擦）
+  stop_loss_pct: 0.25        # 亏损25%时止损（给事件市场波动留空间）
   pre_resolution_hours: 2.0  # 结果公布前2小时强制平仓
   min_edge_to_hold: 0.02     # edge降至2%以下时平仓（模型不再支持持仓）
+  exit_max_retries: 5           # 平仓失败最多重试5次后强制记账
+  exit_price_step: 0.01         # 每次重试降价1 tick
+  force_close_cooldown_hours: 24  # 强制记账后封禁该市场24小时，防止立即重入
+  exit_cooldown_hours: 4          # 任何原因平仓后，该市场4小时内不再开仓
 
 trading:
-  loop_interval_s: 60
+  loop_interval_s: 15
+  ban_sports_esports: true  # 禁止体育/电竞赛事类市场（true=开启过滤）
 
 logging:
   level: INFO
