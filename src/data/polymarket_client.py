@@ -1,20 +1,27 @@
 """
 Polymarket API Client
 
-REST + WebSocket client for market data and order management.
-Supports mock mode for testing without API keys.
+Uses py-clob-client SDK for real trading + REST for market discovery.
+Automatically switches between mock and live mode based on credentials.
 """
 
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 import httpx
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
+
+# Load .env from project root
+_env_path = Path(__file__).parent.parent.parent / ".env"
+load_dotenv(_env_path)
 
 
 class MarketStatus(str, Enum):
@@ -32,7 +39,7 @@ class Market:
     question: str
     outcomes: list[str]
     outcome_prices: list[float]
-    tokens: list[dict]  # {token_id, outcome}
+    tokens: list[dict]  # [{token_id, outcome}]
     volume_24h: float
     liquidity: float
     end_date: str
@@ -87,89 +94,75 @@ class OrderBook:
         return self.best_ask - self.best_bid
 
 
-# ─── Mock data for testing ────────────────────────────────────
-
-MOCK_MARKETS = [
-    Market(
-        id="mock-market-1",
-        condition_id="0xabc123",
-        question="Will BTC exceed $100,000 by March 31, 2026?",
-        outcomes=["Yes", "No"],
-        outcome_prices=[0.72, 0.28],
-        tokens=[
-            {"token_id": "token-yes-1", "outcome": "Yes"},
-            {"token_id": "token-no-1", "outcome": "No"},
-        ],
-        volume_24h=125000.0,
-        liquidity=450000.0,
-        end_date="2026-03-31T00:00:00Z",
-        status=MarketStatus.ACTIVE,
-        category="Crypto",
-    ),
-    Market(
-        id="mock-market-2",
-        condition_id="0xdef456",
-        question="Will the Fed cut rates in Q1 2026?",
-        outcomes=["Yes", "No"],
-        outcome_prices=[0.35, 0.65],
-        tokens=[
-            {"token_id": "token-yes-2", "outcome": "Yes"},
-            {"token_id": "token-no-2", "outcome": "No"},
-        ],
-        volume_24h=89000.0,
-        liquidity=320000.0,
-        end_date="2026-03-31T23:59:59Z",
-        status=MarketStatus.ACTIVE,
-        category="Economics",
-    ),
-    Market(
-        id="mock-market-3",
-        condition_id="0x789ghi",
-        question="Will oil prices exceed $100/barrel by April 2026?",
-        outcomes=["Yes", "No"],
-        outcome_prices=[0.58, 0.42],
-        tokens=[
-            {"token_id": "token-yes-3", "outcome": "Yes"},
-            {"token_id": "token-no-3", "outcome": "No"},
-        ],
-        volume_24h=67000.0,
-        liquidity=210000.0,
-        end_date="2026-04-30T00:00:00Z",
-        status=MarketStatus.ACTIVE,
-        category="Commodities",
-    ),
-]
-
-
 class PolymarketClient:
-    """Async Polymarket API client with mock mode support."""
+    """Polymarket client with auto mock/live switching.
+
+    If .env has valid credentials → live mode
+    Otherwise → mock mode with synthetic data
+    """
+
+    GAMMA_API = "https://gamma-api.polymarket.com"
+    CLOB_API = "https://clob.polymarket.com"
 
     def __init__(
         self,
+        private_key: str = "",
         api_key: str = "",
-        rest_url: str = "https://gamma-api.polymarket.com",
-        clob_url: str = "https://clob.polymarket.com",
-        mock: bool = True,
+        api_secret: str = "",
+        api_passphrase: str = "",
+        dry_run: bool = True,
         rate_limit_rps: float = 5.0,
     ):
-        self.api_key = api_key
-        self.rest_url = rest_url
-        self.clob_url = clob_url
-        self.mock = mock
+        # Try loading from env if not provided
+        self.private_key = private_key or os.getenv("POLYMARKET_PRIVATE_KEY", "")
+        self.api_key = api_key or os.getenv("POLYMARKET_API_KEY", "")
+        self.api_secret = api_secret or os.getenv("POLYMARKET_API_SECRET", "")
+        self.api_passphrase = api_passphrase or os.getenv("POLYMARKET_API_PASSPHRASE", "")
+        self.dry_run = dry_run
+
+        # Determine mode
+        self.has_credentials = bool(self.private_key and self.api_key)
+        self.mock = not self.has_credentials
+
+        if self.mock:
+            logger.warning("⚠️ No credentials found — running in MOCK mode")
+            logger.warning("   Fill .env with your keys to connect to Polymarket")
+        else:
+            logger.info("🔑 Credentials loaded — LIVE data mode" +
+                        (" (dry_run=true, no real orders)" if dry_run else " ⚡ LIVE TRADING"))
+
         self._rate_limit_interval = 1.0 / rate_limit_rps
         self._last_request_time = 0.0
-        self._client: httpx.AsyncClient | None = None
+        self._http: httpx.AsyncClient | None = None
+        self._clob_client = None
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            headers = {}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            self._client = httpx.AsyncClient(
-                headers=headers,
-                timeout=httpx.Timeout(30.0),
-            )
-        return self._client
+    def _init_clob_client(self):
+        """Lazy-init the py-clob-client SDK."""
+        if self._clob_client is None and self.has_credentials:
+            try:
+                from py_clob_client.client import ClobClient
+                from py_clob_client.clob_types import ApiCreds
+
+                creds = ApiCreds(
+                    api_key=self.api_key,
+                    api_secret=self.api_secret,
+                    api_passphrase=self.api_passphrase,
+                )
+                self._clob_client = ClobClient(
+                    host=self.CLOB_API,
+                    key=self.private_key,
+                    chain_id=137,
+                    creds=creds,
+                )
+                logger.info("✅ CLOB client initialized")
+            except Exception as e:
+                logger.error(f"Failed to init CLOB client: {e}")
+                self._clob_client = None
+
+    async def _get_http(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+        return self._http
 
     async def _rate_limit(self) -> None:
         now = time.monotonic()
@@ -178,9 +171,9 @@ class PolymarketClient:
             await asyncio.sleep(self._rate_limit_interval - elapsed)
         self._last_request_time = time.monotonic()
 
-    async def _get(self, url: str, params: dict | None = None) -> dict:
+    async def _get_json(self, url: str, params: dict | None = None) -> dict | list:
         await self._rate_limit()
-        client = await self._get_client()
+        client = await self._get_http()
         for attempt in range(3):
             try:
                 resp = await client.get(url, params=params)
@@ -193,114 +186,298 @@ class PolymarketClient:
                 else:
                     raise
 
+    # ─── Market Data (Gamma API — no auth needed) ─────────────
+
     async def get_markets(
         self,
         limit: int = 50,
         active_only: bool = True,
+        min_volume: float = 0,
     ) -> list[Market]:
-        """Fetch active prediction markets.
+        """Fetch prediction markets from Gamma API (public, no auth).
 
-        Args:
-            limit: Maximum markets to return
-            active_only: Only return active (unresolved) markets
-
-        Returns:
-            List of Market objects
+        Works in both mock and live mode — Gamma API is always public.
         """
         if self.mock:
-            logger.info(f"[MOCK] Returning {len(MOCK_MARKETS)} mock markets")
-            return MOCK_MARKETS[:limit]
+            return _MOCK_MARKETS[:limit]
 
-        data = await self._get(
-            f"{self.rest_url}/markets",
-            params={"limit": limit, "active": active_only},
-        )
+        try:
+            data = await self._get_json(
+                f"{self.GAMMA_API}/markets",
+                params={
+                    "limit": limit,
+                    "active": active_only,
+                    "order": "volume24hr",
+                    "ascending": False,
+                },
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch markets: {e}")
+            return []
 
         markets = []
-        for item in data:
+        for item in data if isinstance(data, list) else []:
             try:
-                prices = json.loads(item.get("outcomePrices", "[]"))
-                prices = [float(p) for p in prices]
-                tokens = json.loads(item.get("clobTokenIds", "[]"))
-                outcomes = json.loads(item.get("outcomes", "[]"))
+                market = self._parse_market(item)
+                if market and market.volume_24h >= min_volume:
+                    markets.append(market)
+            except Exception as e:
+                logger.debug(f"Skipping unparseable market: {e}")
 
-                token_list = [
-                    {"token_id": tid, "outcome": out}
-                    for tid, out in zip(tokens, outcomes)
-                ]
-
-                market = Market(
-                    id=item["id"],
-                    condition_id=item.get("conditionId", ""),
-                    question=item.get("question", ""),
-                    outcomes=outcomes,
-                    outcome_prices=prices,
-                    tokens=token_list,
-                    volume_24h=float(item.get("volume24hr", 0)),
-                    liquidity=float(item.get("liquidityClob", 0)),
-                    end_date=item.get("endDate", ""),
-                    status=MarketStatus.ACTIVE,
-                    category=item.get("category", ""),
-                    description=item.get("description", ""),
-                )
-                markets.append(market)
-            except (KeyError, ValueError, json.JSONDecodeError) as e:
-                logger.warning(f"Failed to parse market: {e}")
-                continue
-
-        logger.info(f"Fetched {len(markets)} markets from Polymarket")
+        logger.info(f"📊 Fetched {len(markets)} markets from Polymarket")
         return markets
 
     async def get_market(self, market_id: str) -> Market | None:
-        """Fetch a single market by ID."""
+        """Fetch a single market."""
         if self.mock:
-            return next((m for m in MOCK_MARKETS if m.id == market_id), None)
+            return next((m for m in _MOCK_MARKETS if m.id == market_id), None)
 
-        data = await self._get(f"{self.rest_url}/markets/{market_id}")
-        # Parse same as above (simplified)
-        return None  # TODO: full parsing
+        try:
+            data = await self._get_json(f"{self.GAMMA_API}/markets/{market_id}")
+            return self._parse_market(data)
+        except Exception as e:
+            logger.error(f"Failed to fetch market {market_id}: {e}")
+            return None
 
     async def get_orderbook(self, token_id: str) -> OrderBook:
-        """Fetch order book for a specific token.
+        """Fetch CLOB order book for a token."""
+        if self.mock:
+            return _mock_orderbook(token_id)
+
+        try:
+            data = await self._get_json(
+                f"{self.CLOB_API}/book",
+                params={"token_id": token_id},
+            )
+            bids = [
+                OrderBookEntry(price=float(b["price"]), size=float(b["size"]))
+                for b in data.get("bids", [])
+            ]
+            asks = [
+                OrderBookEntry(price=float(a["price"]), size=float(a["size"]))
+                for a in data.get("asks", [])
+            ]
+            return OrderBook(token_id=token_id, bids=bids, asks=asks)
+        except Exception as e:
+            logger.error(f"Failed to fetch orderbook for {token_id}: {e}")
+            return OrderBook(token_id=token_id)
+
+    # ─── Trading (CLOB SDK — needs auth) ──────────────────────
+
+    def place_order(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+    ) -> dict:
+        """Place a limit order via CLOB SDK (synchronous).
 
         Args:
-            token_id: The CLOB token ID
+            token_id: Token to trade
+            side: "BUY" or "SELL"
+            price: Limit price (0-1, increments of 0.01)
+            size: Number of shares
 
         Returns:
-            OrderBook with bids and asks
+            Order result dict
         """
-        if self.mock:
-            return OrderBook(
-                token_id=token_id,
-                bids=[
-                    OrderBookEntry(price=0.50, size=1000),
-                    OrderBookEntry(price=0.49, size=2000),
-                    OrderBookEntry(price=0.48, size=3000),
-                ],
-                asks=[
-                    OrderBookEntry(price=0.52, size=800),
-                    OrderBookEntry(price=0.53, size=1500),
-                    OrderBookEntry(price=0.55, size=2500),
-                ],
+        if self.dry_run:
+            result = {
+                "orderID": f"dry-{int(time.time())}",
+                "status": "DRY_RUN",
+                "token_id": token_id,
+                "side": side,
+                "price": price,
+                "size": size,
+            }
+            logger.info(f"[DRY RUN] {side} {size:.1f} @ ${price:.2f} — {token_id[:16]}...")
+            return result
+
+        self._init_clob_client()
+        if not self._clob_client:
+            raise RuntimeError("CLOB client not available — check credentials")
+
+        from py_clob_client.order_builder.constants import BUY, SELL
+
+        order_side = BUY if side == "BUY" else SELL
+
+        # Build and sign order
+        order_args = {
+            "token_id": token_id,
+            "price": price,
+            "size": size,
+            "side": order_side,
+        }
+
+        try:
+            signed_order = self._clob_client.create_and_post_order(order_args)
+            logger.info(f"✅ Order placed: {side} {size:.1f} @ ${price:.2f}")
+            return signed_order
+        except Exception as e:
+            logger.error(f"❌ Order failed: {e}")
+            raise
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel an order via CLOB SDK."""
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Cancel order {order_id}")
+            return True
+
+        self._init_clob_client()
+        if not self._clob_client:
+            return False
+
+        try:
+            self._clob_client.cancel(order_id)
+            logger.info(f"✅ Cancelled order {order_id}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Cancel failed: {e}")
+            return False
+
+    def cancel_all_orders(self) -> bool:
+        """Cancel all open orders."""
+        if self.dry_run:
+            logger.info("[DRY RUN] Cancel all orders")
+            return True
+
+        self._init_clob_client()
+        if not self._clob_client:
+            return False
+
+        try:
+            self._clob_client.cancel_all()
+            logger.info("✅ All orders cancelled")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Cancel all failed: {e}")
+            return False
+
+    def get_open_orders(self) -> list[dict]:
+        """Get open orders from CLOB."""
+        if self.mock or self.dry_run:
+            return []
+
+        self._init_clob_client()
+        if not self._clob_client:
+            return []
+
+        try:
+            return self._clob_client.get_orders()
+        except Exception as e:
+            logger.error(f"Failed to fetch orders: {e}")
+            return []
+
+    # ─── Helpers ──────────────────────────────────────────────
+
+    def _parse_market(self, item: dict) -> Market | None:
+        """Parse a Gamma API market response into Market dataclass."""
+        try:
+            # Parse JSON string fields
+            outcomes_raw = item.get("outcomes", "[]")
+            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+
+            prices_raw = item.get("outcomePrices", "[]")
+            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+            prices = [float(p) for p in prices]
+
+            tokens_raw = item.get("clobTokenIds", "[]")
+            token_ids = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+
+            token_list = [
+                {"token_id": tid, "outcome": out}
+                for tid, out in zip(token_ids, outcomes)
+            ]
+
+            return Market(
+                id=item.get("id", ""),
+                condition_id=item.get("conditionId", ""),
+                question=item.get("question", "Unknown"),
+                outcomes=outcomes,
+                outcome_prices=prices,
+                tokens=token_list,
+                volume_24h=float(item.get("volume24hr", 0)),
+                liquidity=float(item.get("liquidityClob", 0) or 0),
+                end_date=item.get("endDate", ""),
+                status=MarketStatus.ACTIVE,
+                category=item.get("category", ""),
+                description=item.get("description", ""),
             )
-
-        data = await self._get(
-            f"{self.clob_url}/book",
-            params={"token_id": token_id},
-        )
-
-        bids = [
-            OrderBookEntry(price=float(b["price"]), size=float(b["size"]))
-            for b in data.get("bids", [])
-        ]
-        asks = [
-            OrderBookEntry(price=float(a["price"]), size=float(a["size"]))
-            for a in data.get("asks", [])
-        ]
-
-        return OrderBook(token_id=token_id, bids=bids, asks=asks)
+        except (KeyError, ValueError, json.JSONDecodeError) as e:
+            logger.debug(f"Parse error: {e}")
+            return None
 
     async def close(self) -> None:
-        """Close the HTTP client."""
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
+        if self._http and not self._http.is_closed:
+            await self._http.aclose()
+
+
+# ─── Mock Data ────────────────────────────────────────────────
+
+_MOCK_MARKETS = [
+    Market(
+        id="mock-btc-100k",
+        condition_id="0xmock1",
+        question="Will BTC exceed $100,000 by March 31, 2026?",
+        outcomes=["Yes", "No"],
+        outcome_prices=[0.72, 0.28],
+        tokens=[
+            {"token_id": "mock-token-yes-1", "outcome": "Yes"},
+            {"token_id": "mock-token-no-1", "outcome": "No"},
+        ],
+        volume_24h=125000.0,
+        liquidity=450000.0,
+        end_date="2026-03-31T00:00:00Z",
+        status=MarketStatus.ACTIVE,
+        category="Crypto",
+    ),
+    Market(
+        id="mock-fed-rate-cut",
+        condition_id="0xmock2",
+        question="Will the Fed cut rates in Q1 2026?",
+        outcomes=["Yes", "No"],
+        outcome_prices=[0.35, 0.65],
+        tokens=[
+            {"token_id": "mock-token-yes-2", "outcome": "Yes"},
+            {"token_id": "mock-token-no-2", "outcome": "No"},
+        ],
+        volume_24h=89000.0,
+        liquidity=320000.0,
+        end_date="2026-03-31T23:59:59Z",
+        status=MarketStatus.ACTIVE,
+        category="Economics",
+    ),
+    Market(
+        id="mock-oil-100",
+        condition_id="0xmock3",
+        question="Will oil prices exceed $100/barrel by April 2026?",
+        outcomes=["Yes", "No"],
+        outcome_prices=[0.58, 0.42],
+        tokens=[
+            {"token_id": "mock-token-yes-3", "outcome": "Yes"},
+            {"token_id": "mock-token-no-3", "outcome": "No"},
+        ],
+        volume_24h=67000.0,
+        liquidity=210000.0,
+        end_date="2026-04-30T00:00:00Z",
+        status=MarketStatus.ACTIVE,
+        category="Commodities",
+    ),
+]
+
+
+def _mock_orderbook(token_id: str) -> OrderBook:
+    return OrderBook(
+        token_id=token_id,
+        bids=[
+            OrderBookEntry(price=0.50, size=1000),
+            OrderBookEntry(price=0.49, size=2000),
+            OrderBookEntry(price=0.48, size=3000),
+        ],
+        asks=[
+            OrderBookEntry(price=0.52, size=800),
+            OrderBookEntry(price=0.53, size=1500),
+            OrderBookEntry(price=0.55, size=2500),
+        ],
+    )
