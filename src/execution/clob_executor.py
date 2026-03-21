@@ -489,10 +489,18 @@ class CLOBExecutor:
                 order.status = OrderStatus.FAILED
                 return order
 
+            import math
+            # For SELL orders: floor to 2dp to avoid exceeding CLOB balance
+            # (on-chain balance may be e.g. 4.9999 shares, round() gives 5.0 > CLOB limit)
+            # For BUY orders: round() is safe (we're spending USDC, not tokens)
+            if side == OrderSide.SELL:
+                safe_size = math.floor(size * 100) / 100
+            else:
+                safe_size = round(size, 2)
             order_args = OrderArgs(
                 token_id=token_id,
                 price=snapped_price,
-                size=round(size, 2),
+                size=safe_size,
                 side=BUY if side == OrderSide.BUY else SELL,
             )
             options = PartialCreateOrderOptions(

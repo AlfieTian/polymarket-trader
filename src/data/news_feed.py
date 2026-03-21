@@ -221,8 +221,30 @@ class NewsFeed:
             logger.debug(f"📰 RSS: {len(top)} relevant headlines for query")
             return top
 
-        # Fallback: Brave (only if key present and RSS came up empty)
-        if self._brave_api_key:
+        # Fallback 2: SearXNG (self-hosted, no quota) — try before Brave
+        try:
+            client = await self._get_http()
+            resp = await client.get(
+                "http://192.168.55.10:2048/search",
+                params={"q": query, "format": "json", "language": "en"},
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                headlines = []
+                for result in data.get("results", [])[:count]:
+                    title = result.get("title", "")
+                    content = result.get("content", "")[:200]
+                    headlines.append(f"{title}: {content}" if content else title)
+                if headlines:
+                    logger.debug(f"📰 SearXNG: {len(headlines)} headlines for query")
+                    return headlines
+        except Exception as e:
+            logger.debug(f"SearXNG fallback failed: {e}")
+
+        # Fallback 3: Brave (only if key present, RSS came up empty, and not over quota)
+        # Note: Brave free tier is limited — skip if we already know it's 402'ing
+        if self._brave_api_key and not getattr(self, "_brave_quota_exceeded", False):
             try:
                 client = await self._get_http()
                 resp = await client.get(
@@ -230,6 +252,10 @@ class NewsFeed:
                     params={"q": query, "count": count, "freshness": "pd"},
                     headers={"X-Subscription-Token": self._brave_api_key},
                 )
+                if resp.status_code == 402:
+                    logger.warning("📰 Brave Search quota exceeded (402) — disabling for this session")
+                    self._brave_quota_exceeded = True
+                    return []
                 resp.raise_for_status()
                 data = resp.json()
                 headlines = []
