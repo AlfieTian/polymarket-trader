@@ -24,32 +24,13 @@ _env_path = Path(__file__).parent.parent.parent / ".env"
 load_dotenv(_env_path)
 
 # ── Sports / Esports market ban ───────────────────────────────────────────────
-# Keywords matched case-insensitively against the market question.
-# If any keyword is found, the market is blocked from trading.
-_BANNED_KEYWORDS: list[str] = [
-    # Sports
-    "soccer", "football", "basketball", "tennis", "baseball", "hockey", "golf",
-    "nfl", "nba", "mlb", "nhl", "mls",
-    "premier league", "la liga", "bundesliga", "serie a", "ligue 1",
-    "champions league", "europa league", "world cup", "super bowl",
-    "match winner", "set winner", "game winner",
-    "bnp paribas", "australian open", "wimbledon", "us open", "roland garros",
-    "atp", "wta", "fifa", "ufc", "boxing", "mma", "wrestling",
-    "f1", "formula 1", "formula one", "tour de france", "olympics",
-    # Esports
-    "esports", "e-sports", "cs2", "counter-strike", "dota", "league of legends",
-    " lol ", "valorant", "overwatch", "csgo", "cs:go",
-    "esl", "blast", "iem", "pgl", "faceit", "hltv",
-    "natus vincere", "navi", " g2 ", "astralis", "faze", "team liquid",
-    "fnatic", "cloud9", " t1 ", "furia", "fut esports", "mouz",
-    "epl season", "esl pro league",
-]
 
+def is_banned_market(question: str, sports_market_type: str = "") -> bool:
+    """Return True if the market should be excluded (sports/esports).
 
-def is_banned_market(question: str) -> bool:
-    """Return True if the market question matches a banned sports/esports keyword."""
-    q = question.lower()
-    return any(kw in q for kw in _BANNED_KEYWORDS)
+    Uses the sportsMarketType field from Gamma API — non-empty means sports/esports.
+    """
+    return bool(sports_market_type)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -75,6 +56,7 @@ class Market:
     status: MarketStatus
     category: str = ""
     description: str = ""
+    sports_market_type: str = ""  # non-empty = sports/esports market (moneyline/spreads/etc)
 
     @property
     def yes_price(self) -> float:
@@ -251,8 +233,11 @@ class PolymarketClient:
                 market = self._parse_market(item)
                 if not market or market.volume_24h < min_volume:
                     continue
-                if is_banned_market(market.question):
-                    logger.debug(f"🚫 Banned market (sports/esports): {market.question[:60]}")
+                if is_banned_market(market.question, market.sports_market_type):
+                    logger.debug(
+                        f"🚫 Banned market (sports/esports): {market.question[:60]}"
+                        + (f" [sportsMarketType={market.sports_market_type}]" if market.sports_market_type else "")
+                    )
                     banned_count += 1
                     continue
                 markets.append(market)
@@ -404,6 +389,48 @@ class PolymarketClient:
             logger.error(f"Failed to fetch orders: {e}")
             return []
 
+    # ─── Wallet Positions (Data API) ────────────────────────────
+
+    DATA_API = "https://data-api.polymarket.com"
+
+    async def get_wallet_positions(self, wallet_address: str) -> list[dict]:
+        """Fetch all positions for a wallet from Polymarket data API.
+
+        Returns list of dicts with keys like:
+            asset, conditionId, size, avgPrice, market (slug), side, etc.
+        """
+        if self.mock:
+            return []
+
+        try:
+            data = await self._get_json(
+                f"{self.DATA_API}/positions",
+                params={"user": wallet_address.lower()},
+            )
+            if not isinstance(data, list):
+                return []
+            # Filter to positions with non-zero size
+            return [p for p in data if float(p.get("size", 0)) > 0]
+        except Exception as e:
+            logger.warning(f"Failed to fetch wallet positions from data API: {e}")
+            return []
+
+    async def get_market_by_condition(self, condition_id: str) -> Market | None:
+        """Fetch a market by its condition ID via Gamma API."""
+        if self.mock:
+            return None
+        try:
+            data = await self._get_json(
+                f"{self.GAMMA_API}/markets",
+                params={"conditionId": condition_id},
+            )
+            items = data if isinstance(data, list) else []
+            if items:
+                return self._parse_market(items[0])
+        except Exception as e:
+            logger.warning(f"Failed to fetch market by condition {condition_id}: {e}")
+        return None
+
     # ─── Helpers ──────────────────────────────────────────────
 
     def _parse_market(self, item: dict) -> Market | None:
@@ -438,6 +465,7 @@ class PolymarketClient:
                 status=MarketStatus.ACTIVE,
                 category=item.get("category", ""),
                 description=item.get("description", ""),
+                sports_market_type=item.get("sportsMarketType", "") or "",
             )
         except (KeyError, ValueError, json.JSONDecodeError) as e:
             logger.debug(f"Parse error: {e}")

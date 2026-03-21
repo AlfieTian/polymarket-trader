@@ -48,18 +48,21 @@ def load_config(path: str = "config.yaml") -> dict:
 
 
 def setup_logging(config: dict) -> None:
+    from logging.handlers import RotatingFileHandler
     log_config = config.get("logging", {})
     level = getattr(logging, log_config.get("level", "INFO"))
     log_file = log_config.get("file", "logs/trader.log")
     log_path = Path(__file__).parent.parent / log_file
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Rotate at 20 MB, keep 5 backups → max ~100 MB log storage
+    file_handler = RotatingFileHandler(log_path, maxBytes=20 * 1024 * 1024, backupCount=5)
     logging.basicConfig(
         level=level,
         format="%(message)s",
         datefmt="[%X]",
         handlers=[
             RichHandler(console=console, rich_tracebacks=True),
-            logging.FileHandler(log_path),
+            file_handler,
         ],
     )
 
@@ -154,6 +157,17 @@ class Trader:
         self.perf = PerformanceTracker()
         self._strat_cfg = strat_cfg  # live reference for adaptive updates
 
+        # ── Pending orders (limit orders awaiting fill) ──────────────────────
+        self._pending_orders_file = Path(__file__).parent.parent / "logs" / "pending_orders.json"
+        self._pending_orders: list[dict] = self._load_pending_orders()
+        self._pending_order_max_age_s = config.get("trading", {}).get("pending_order_max_age_s", 300)  # 5 min default
+        # ────────────────────────────────────────────────────────────────────
+
+        # ── On-chain reconciliation interval ─────────────────────────────────
+        self._reconcile_interval_cycles = config.get("trading", {}).get("reconcile_interval_cycles", 10)
+        self._wallet_address = os.getenv("POLYMARKET_WALLET_ADDRESS", "")
+        # ────────────────────────────────────────────────────────────────────
+
         self._resync_portfolio_trackers()
 
     # ── Cooldown helpers ────────────────────────────────────────────────────
@@ -216,6 +230,351 @@ class Trader:
             return False
         return True
 
+    # ── Pending order helpers ─────────────────────────────────────────────
+
+    def _load_pending_orders(self) -> list[dict]:
+        if self._pending_orders_file.exists():
+            try:
+                return json.loads(self._pending_orders_file.read_text())
+            except Exception:
+                pass
+        return []
+
+    def _save_pending_orders(self) -> None:
+        self._pending_orders_file.parent.mkdir(parents=True, exist_ok=True)
+        self._pending_orders_file.write_text(json.dumps(self._pending_orders, indent=2))
+
+    def _add_pending_order(self, order_id: str, opp, market, token_id: str, entry_price: float, shares: float) -> None:
+        self._pending_orders.append({
+            "order_id": order_id,
+            "market_id": opp.market_id,
+            "condition_id": market.condition_id,
+            "token_id": token_id,
+            "side": opp.side,
+            "entry_price": entry_price,
+            "size": shares,
+            "p_hat": opp.p_hat,
+            "market_price": opp.market_price,
+            "end_date": market.end_date,
+            "created_at": time.time(),
+        })
+        self._save_pending_orders()
+        logger.info(f"📋 Pending order saved: {opp.market_id} {opp.side} order_id={order_id}")
+
+    def _check_pending_orders(self) -> None:
+        """Check all pending orders for fills; record positions or cancel stale ones."""
+        if not self._pending_orders:
+            return
+
+        remaining = []
+        for po in self._pending_orders:
+            age_s = time.time() - po["created_at"]
+            order_id = po["order_id"]
+
+            # Build a minimal Order object to query status
+            from src.execution.clob_executor import Order, OrderStatus as OS
+            order = Order(
+                order_id=order_id,
+                token_id=po["token_id"],
+                side=OrderSide.BUY,
+                price=po["entry_price"],
+                size=po["size"],
+            )
+            order = self.executor.refresh_order_status(order)
+
+            if order.status in (OS.FILLED, OS.PARTIALLY_FILLED) and order.filled_size > 0:
+                avg_price = order.filled_avg_price or po["entry_price"]
+                actual_size = order.filled_size
+                actual_size_usdc = round(actual_size * avg_price, 4)
+
+                position = Position(
+                    market_id=po["market_id"],
+                    condition_id=po["condition_id"],
+                    token_id=po["token_id"],
+                    side=po["side"],
+                    entry_price=avg_price,
+                    size=actual_size,
+                    size_usdc=actual_size_usdc,
+                    p_hat_at_entry=po["p_hat"],
+                    market_price_at_entry=po["market_price"],
+                    end_date=po.get("end_date", ""),
+                )
+                self.positions.add_position(position)
+                self.risk.record_position(po["market_id"], actual_size_usdc)
+                self.kelly.record_position(po["market_id"], actual_size_usdc)
+
+                fill_type = "fully" if order.status == OS.FILLED else "partially"
+                logger.info(
+                    f"✅ Pending order {fill_type} filled: {po['market_id']} {po['side']} "
+                    f"{actual_size:.2f} shares @ ${avg_price:.3f} (${actual_size_usdc:.2f} USDC)"
+                )
+
+                # If partially filled, keep tracking the remainder
+                if order.status == OS.PARTIALLY_FILLED:
+                    po["size"] = po["size"] - actual_size
+                    remaining.append(po)
+                continue
+
+            if order.status in (OS.CANCELLED, OS.FAILED):
+                logger.warning(f"❌ Pending order {order_id} {po['market_id']}: {order.status.value}, removing")
+                continue
+
+            # Still open — check age
+            if age_s > self._pending_order_max_age_s:
+                logger.warning(
+                    f"⏰ Pending order {order_id} {po['market_id']} expired after "
+                    f"{age_s:.0f}s — cancelling"
+                )
+                self.executor.cancel_order(order_id)
+                continue
+
+            # Still pending, keep tracking
+            remaining.append(po)
+
+        self._pending_orders = remaining
+        self._save_pending_orders()
+
+    # ── Periodic on-chain reconciliation ─────────────────────────────────
+
+    async def _get_best_bid(self, token_id: str, fallback_price: float) -> float:
+        """Fetch best bid from the CLOB orderbook for a token.
+
+        For exit orders we want to sell INTO the bid side so the order fills
+        immediately, rather than placing a limit sell at the mid/ask price
+        that sits on the book unfilled.
+
+        Falls back to (fallback_price - 2 ticks) if orderbook fetch fails.
+        """
+        try:
+            ob = await self.client.get_orderbook(token_id)
+            if ob.bids:
+                best_bid = ob.best_bid
+                logger.info(
+                    f"📕 Best bid for {token_id[:16]}...: ${best_bid:.4f} "
+                    f"(mid would be ${fallback_price:.4f})"
+                )
+                return best_bid
+        except Exception as e:
+            logger.warning(f"Orderbook fetch failed for {token_id[:16]}...: {e}")
+
+        # Fallback: discount the mid price by 2 ticks to cross the spread
+        discounted = round(fallback_price - 0.02, 4)
+        logger.info(
+            f"📕 Using discounted price for {token_id[:16]}...: "
+            f"${discounted:.4f} (mid=${fallback_price:.4f} - 2 ticks)"
+        )
+        return max(discounted, 0.01)
+
+    async def _ensure_position_prices(
+        self, prices: dict[str, float], market_map: dict
+    ) -> None:
+        """Fetch current prices for open positions missing from the market discovery results.
+
+        Without this, positions in low-volume or delisted markets never get exit checks
+        because their market_id isn't in the prices dict.
+        """
+        missing = [
+            pos for pos in self.positions.open_positions
+            if pos.market_id not in prices
+        ]
+        if not missing:
+            return
+
+        logger.info(
+            f"🔍 Fetching prices for {len(missing)} position(s) not in market discovery"
+        )
+        for pos in missing:
+            try:
+                market = await self.client.get_market(pos.market_id)
+                if market is None:
+                    # Fallback: try by condition_id
+                    market = await self.client.get_market_by_condition(pos.condition_id)
+                if market:
+                    prices[market.id] = market.yes_price
+                    # Also add to market_map so _execute_exit can find token_id etc.
+                    market_map[market.id] = market
+                    # If market_id in position differs from fetched id, add both keys
+                    if pos.market_id != market.id:
+                        prices[pos.market_id] = market.yes_price
+                        market_map[pos.market_id] = market
+                    logger.info(
+                        f"  📈 {pos.market_id}: YES={market.yes_price:.3f} "
+                        f"(pos {pos.side} entry=${pos.entry_price:.3f})"
+                    )
+                else:
+                    logger.warning(f"  ⚠️ Could not fetch price for position {pos.market_id}")
+            except Exception as e:
+                logger.warning(f"  ⚠️ Price fetch failed for {pos.market_id}: {e}")
+
+    async def _periodic_onchain_reconcile(self) -> None:
+        """Reconcile local positions against on-chain state (runs every N cycles).
+
+        1. Verify existing positions: adjust size or remove if on-chain balance differs.
+        2. Discover phantom positions: tokens held on-chain but missing from local state.
+        """
+        if self.dry_run or not self._wallet_address:
+            return
+
+        logger.info("🔗 Periodic on-chain reconciliation start")
+        state_changed = False
+        adjusted = 0
+        removed = 0
+
+        # ── Step 1: Verify existing local positions against on-chain ──
+        for pos in list(self.positions.open_positions):
+            # Check if market has resolved — remove losing positions, redeem winners
+            if pos.condition_id:
+                resolution = self.redeemer.is_resolved(pos.condition_id)
+                if resolution is not None:
+                    won = (resolution["payout_yes"] > 0) if pos.side == "YES" else (resolution["payout_no"] > 0)
+                    logger.warning(
+                        f"🏁 On-chain reconcile: {pos.market_id} RESOLVED — "
+                        f"{pos.side} {'WON' if won else 'LOST'}"
+                    )
+                    if not won:
+                        # Losing position — tokens are worthless, just remove
+                        self.positions.close_position(pos.market_id)
+                        self.risk.close_position(pos.market_id)
+                        self.kelly.close_position(pos.market_id)
+                        self.risk.record_pnl(-pos.size_usdc)
+                        self._add_exit_cooldown(pos.market_id)
+                        removed += 1
+                        state_changed = True
+                        continue
+                    # Won — leave for the existing _check_redemptions to handle
+                    continue
+
+            actual_balance = self.executor._onchain_token_balance(pos.token_id)
+            if actual_balance == float("inf"):
+                continue  # RPC failed, skip
+
+            if actual_balance < 0.01:
+                logger.warning(
+                    f"🧹 On-chain reconcile: removing {pos.market_id} — "
+                    f"no on-chain balance for token {pos.token_id[:16]}..."
+                )
+                self.positions.close_position(pos.market_id)
+                self.risk.close_position(pos.market_id)
+                self.kelly.close_position(pos.market_id)
+                self._add_exit_cooldown(pos.market_id)
+                removed += 1
+                state_changed = True
+                continue
+
+            if abs(actual_balance - pos.size) > 0.01:
+                old_size = pos.size
+                old_usdc = pos.size_usdc
+                scale = (actual_balance / pos.size) if pos.size > 0 else 1.0
+                pos.size = round(actual_balance, 6)
+                pos.size_usdc = round(old_usdc * scale, 4)
+                pos.exit_retries = 0
+                pos.exit_price_override = 0.0
+                pos.force_close_failed = False
+                logger.warning(
+                    f"📐 On-chain reconcile: {pos.market_id} shares "
+                    f"{old_size:.4f}→{pos.size:.4f}, "
+                    f"notional ${old_usdc:.2f}→${pos.size_usdc:.2f}"
+                )
+                adjusted += 1
+                state_changed = True
+
+        # ── Step 2: Discover phantom positions via data API ──
+        # Tokens held on-chain but not in local positions_state.json
+        tracked_tokens = {p.token_id for p in self.positions.open_positions}
+        # Also exclude tokens from pending orders (not yet confirmed)
+        pending_tokens = {po.get("token_id", "") for po in self._pending_orders}
+        tracked_tokens |= pending_tokens
+
+        try:
+            remote_positions = await self.client.get_wallet_positions(self._wallet_address)
+        except Exception as e:
+            logger.warning(f"Phantom position discovery failed: {e}")
+            remote_positions = []
+
+        phantoms_found = 0
+        for rp in remote_positions:
+            token_id = rp.get("asset", "")
+            if not token_id or token_id in tracked_tokens:
+                continue
+
+            # Verify on-chain balance
+            onchain_size = self.executor._onchain_token_balance(token_id)
+            if onchain_size == float("inf") or onchain_size < 0.01:
+                continue
+
+            # Skip resolved markets — losing tokens still have raw balance
+            # on-chain but are worthless; don't add them as phantom positions.
+            condition_id = rp.get("conditionId", "")
+            if condition_id:
+                try:
+                    resolution = self.redeemer.is_resolved(condition_id)
+                    if resolution is not None:
+                        logger.info(
+                            f"⏭️  Skipping phantom {token_id[:16]}... — "
+                            f"market already resolved"
+                        )
+                        continue
+                except Exception:
+                    pass
+            market_id = rp.get("market", "") or rp.get("marketId", "") or condition_id
+            side = rp.get("side", "YES").upper()
+            if side not in ("YES", "NO"):
+                side = "YES"
+
+            # Try to get entry price from the API position data
+            avg_price = float(rp.get("avgPrice", 0) or 0)
+            if avg_price <= 0:
+                avg_price = float(rp.get("price", 0) or 0)
+            if avg_price <= 0:
+                # Fallback: estimate from current market price
+                avg_price = 0.50
+
+            size_usdc = round(onchain_size * avg_price, 4)
+
+            # Fetch market metadata if we have a condition_id
+            end_date = ""
+            if condition_id:
+                try:
+                    market_info = await self.client.get_market_by_condition(condition_id)
+                    if market_info:
+                        market_id = market_info.id or market_id
+                        end_date = market_info.end_date or ""
+                except Exception:
+                    pass
+
+            position = Position(
+                market_id=market_id,
+                condition_id=condition_id,
+                token_id=token_id,
+                side=side,
+                entry_price=avg_price,
+                size=round(onchain_size, 6),
+                size_usdc=size_usdc,
+                p_hat_at_entry=avg_price,
+                market_price_at_entry=avg_price,
+                end_date=end_date,
+            )
+            self.positions.add_position(position)
+            self.risk.record_position(market_id, size_usdc)
+            self.kelly.record_position(market_id, size_usdc)
+            phantoms_found += 1
+            state_changed = True
+
+            logger.warning(
+                f"👻 Phantom position discovered: {market_id} {side} "
+                f"{onchain_size:.2f} shares @ ~${avg_price:.3f} "
+                f"(${size_usdc:.2f} USDC) — added to local state"
+            )
+
+        if state_changed:
+            self.positions._save_state()
+            self._resync_portfolio_trackers()
+
+        logger.info(
+            f"🔗 On-chain reconcile done: adjusted={adjusted}, removed={removed}, "
+            f"phantoms={phantoms_found}, open={len(self.positions.open_positions)}"
+        )
+
     # ────────────────────────────────────────────────────────────────────────
 
     def _resync_portfolio_trackers(self) -> None:
@@ -242,6 +601,11 @@ class Trader:
         """
         logger.info("🩺 Startup reconciliation begin")
 
+        # Check any pending orders from last session before cancelling
+        if self._pending_orders:
+            logger.info(f"📋 Checking {len(self._pending_orders)} pending order(s) from last session")
+            self._check_pending_orders()
+
         cancelled_orders = self.executor.cancel_all_live_orders()
         if cancelled_orders:
             logger.warning(
@@ -259,6 +623,26 @@ class Trader:
         removed = 0
         state_changed = False
         for pos in list(self.positions.open_positions):
+            # Check if market already resolved — clean up immediately
+            if pos.condition_id:
+                try:
+                    resolution = self.redeemer.is_resolved(pos.condition_id)
+                    if resolution is not None:
+                        won = (resolution["payout_yes"] > 0) if pos.side == "YES" else (resolution["payout_no"] > 0)
+                        logger.warning(
+                            f"🏁 Startup: {pos.market_id} RESOLVED — "
+                            f"{pos.side} {'WON' if won else 'LOST'}, removing from local state"
+                        )
+                        if not won:
+                            self.risk.record_pnl(-pos.size_usdc)
+                        self.positions.close_position(pos.market_id)
+                        self._add_exit_cooldown(pos.market_id)
+                        removed += 1
+                        state_changed = True
+                        continue
+                except Exception as e:
+                    logger.debug(f"Resolution check failed for {pos.market_id}: {e}")
+
             actual_balance = self.executor._onchain_token_balance(pos.token_id)
             if actual_balance == float("inf"):
                 logger.warning(
@@ -306,8 +690,11 @@ class Trader:
     async def run_cycle(self) -> None:
         t0 = time.perf_counter()
 
+        # ─── 0. Check pending orders from previous cycles ─────
+        self._check_pending_orders()
+
         # ─── 1. Fetch markets ─────────────────────────────────
-        markets = await self.client.get_markets(limit=50, min_volume=1000)
+        markets = await self.client.get_markets(limit=100, min_volume=1000)
 
         tradeable = [m for m in markets if 0.10 <= m.yes_price <= 0.90]
         logger.info(f"📊 {len(markets)} markets → {len(tradeable)} tradeable (10-90%)")
@@ -330,6 +717,12 @@ class Trader:
                    if self.bayesian.get_belief(m.id) else m.yes_price)
             for m in tradeable
         }
+
+        # Ensure all open positions have current prices — fetch individually
+        # for any position whose market wasn't in the discovery results
+        # (e.g. low volume, fell out of top 100). Without this, exits never trigger.
+        await self._ensure_position_prices(current_prices_fast, market_map)
+
         for exit_sig in self.positions.check_exits(current_prices_fast, current_p_hats_fast):
             await self._execute_exit(
                 exit_sig.position, exit_sig.current_price, market_map, exit_sig.reason.value
@@ -375,6 +768,8 @@ class Trader:
         # Same as above: use all markets so out-of-range positions still get exits.
         current_prices = {m.id: m.yes_price for m in markets}
         current_p_hats = {d["market_id"]: d["p_hat"] for d in scan_data}
+        # Re-use already-fetched position prices from fast path (market_map already populated)
+        await self._ensure_position_prices(current_prices, market_map)
         for exit_sig in self.positions.check_exits(current_prices, current_p_hats):
             pos = exit_sig.position
             await self._execute_exit(pos, exit_sig.current_price, market_map, exit_sig.reason.value)
@@ -404,22 +799,24 @@ class Trader:
                     continue
 
                 # Skip if LLM confidence is too low (avoid default-p̂ bets).
-                # Use the average confidence across ALL signals in the belief history
-                # (not just recent ones), which guards against the default p̂=0.05 floor.
+                # Use a RECENT window (last 5 signals) rather than all-time average —
+                # the all-time average permanently dilutes as low-confidence signals
+                # accumulate over many cycles, permanently blocking valid opportunities.
                 belief = self.bayesian.get_belief(opp.market_id)
                 if belief and belief.update_history:
-                    avg_conf = sum(s.get("confidence", 0) for s in belief.update_history) / len(belief.update_history)
+                    recent_signals = belief.update_history[-5:]  # last 5 signals only
+                    avg_conf = sum(s.get("confidence", 0) for s in recent_signals) / len(recent_signals)
                 else:
                     avg_conf = 0.0
                 if avg_conf < self._min_llm_confidence:
                     logger.info(
-                        f"⏭️  {opp.market_id} skipped — avg LLM confidence {avg_conf:.2f} "
+                        f"⏭️  {opp.market_id} skipped — recent LLM confidence {avg_conf:.2f} "
                         f"< min {self._min_llm_confidence:.2f}"
                     )
                     continue
                 logger.info(
                     f"✅ {opp.market_id} {opp.side} approved — edge={opp.edge:+.3f} "
-                    f"p̂={opp.p_hat:.3f} avg_conf={avg_conf:.2f}"
+                    f"p̂={opp.p_hat:.3f} recent_conf={avg_conf:.2f}"
                 )
 
                 # Kelly sizing
@@ -478,6 +875,10 @@ class Trader:
             # USDC.e is visible for the next entry attempt.
             self.executor._sync_clob_balance()
 
+        # ─── 7. Periodic on-chain position reconciliation ────
+        if self._cycle_count % self._reconcile_interval_cycles == 0:
+            await self._periodic_onchain_reconcile()
+
         elapsed = time.perf_counter() - t0
         logger.info(f"⏱️ Cycle in {elapsed:.2f}s")
 
@@ -516,7 +917,25 @@ class Trader:
             condition_id=market.condition_id,
         )
 
-        order = self.executor.refresh_order_status(order)
+        if order.status == OrderStatus.FAILED:
+            logger.warning(f"❌ Entry order failed for {opp.market_id}")
+            return
+
+        # Poll for fill: limit orders may not fill instantly
+        poll_attempts = 6  # 6 x 5s = 30s max wait
+        poll_interval = 5
+        for attempt in range(poll_attempts):
+            order = self.executor.refresh_order_status(order)
+            if order.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+                break
+            if order.status in (OrderStatus.CANCELLED, OrderStatus.FAILED):
+                break
+            if attempt < poll_attempts - 1:
+                logger.info(
+                    f"⏳ Waiting for fill {opp.market_id}: "
+                    f"attempt {attempt + 1}/{poll_attempts}, status={order.status.value}"
+                )
+                await asyncio.sleep(poll_interval)
 
         if order.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED) and order.filled_size > 0:
             # Use actual executed size/avg price (may differ from Kelly size or be partial)
@@ -547,9 +966,12 @@ class Trader:
                 )
 
             self._print_entry(opp, avg_price, actual_size, actual_size_usdc, order)
+        elif order.status in (OrderStatus.OPEN, OrderStatus.PENDING):
+            # Order still on the book — save as pending for next cycle check
+            self._add_pending_order(order.order_id, opp, market, token_id, entry_price, shares)
         else:
             logger.warning(
-                f"⏳ Entry not filled for {opp.market_id}: status={order.status.value}"
+                f"❌ Entry order {opp.market_id}: status={order.status.value}, not recording position"
             )
 
     async def _execute_exit(self, pos: Position, current_price: float, market_map: dict, reason: str) -> None:
@@ -577,15 +999,51 @@ class Trader:
                 pos.exit_price_override = 0.0
                 pos.exit_retries = 0
                 self.positions._save_state()
-        sell_price = pos.exit_price_override if pos.exit_price_override > 0 else current_price
+        if pos.exit_price_override > 0:
+            sell_price = pos.exit_price_override
+        else:
+            # Pricing strategy depends on exit urgency:
+            #   - profit_target: conservative (mid - 1 tick), preserve gains
+            #   - stop_loss / pre_resolution / edge_reversal: aggressive (best bid), speed matters
+            urgent = reason in ("stop_loss", "pre_resolution", "edge_reversal")
+            if urgent:
+                sell_price = await self._get_best_bid(pos.token_id, current_price)
+            else:
+                # Profit target: start conservative, the retry mechanism will
+                # lower the price by 1 tick each cycle if it doesn't fill.
+                meta = self.executor.fetch_market_meta(pos.condition_id) if pos.condition_id else {}
+                tick = float(meta.get("tick_size", "0.01"))
+                sell_price = round(current_price - tick, 4)
         # But never go below 1 tick (avoid 0-price order)
         sell_price = max(round(sell_price, 4), 0.01)
 
         if pos.force_close_failed:
-            logger.warning(
-                f"🚨 force_close_failed still active for {pos.market_id} — "
-                f"retrying exit (manual intervention may be required)"
-            )
+            # Before retrying, sync CLOB balance allowance for this token
+            # (the "not enough balance/allowance" error is often a CLOB cache miss)
+            try:
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                if self.executor._clob_client:
+                    self.executor._clob_client.update_balance_allowance(
+                        params=BalanceAllowanceParams(
+                            asset_type=AssetType.CONDITIONAL,
+                            token_id=pos.token_id,
+                            signature_type=0,
+                        )
+                    )
+                    # Reset retry state after successful sync
+                    pos.exit_retries = 0
+                    pos.exit_price_override = 0.0
+                    pos.force_close_failed = False
+                    self.positions._save_state()
+                    logger.info(
+                        f"🔄 CLOB allowance resynced for {pos.market_id} — "
+                        f"reset exit retries, retrying sell"
+                    )
+            except Exception as sync_err:
+                logger.warning(
+                    f"🚨 force_close_failed still active for {pos.market_id} "
+                    f"(CLOB sync failed: {sync_err}) — manual intervention may be required"
+                )
 
         # Pre-flight: use on-chain balance as sell size (source of truth)
         actual_balance = self.executor._onchain_token_balance(pos.token_id)
@@ -610,7 +1068,17 @@ class Trader:
             condition_id=pos.condition_id,
         )
 
-        order = self.executor.refresh_order_status(order)
+        # Poll for fill: limit orders may not fill instantly
+        for attempt in range(6):
+            order = self.executor.refresh_order_status(order)
+            if order.status not in (OrderStatus.OPEN, OrderStatus.PENDING):
+                break
+            if attempt < 5:
+                logger.info(
+                    f"⏳ Waiting for exit fill {pos.market_id}: "
+                    f"attempt {attempt + 1}/6, status={order.status.value}"
+                )
+                await asyncio.sleep(5)
 
         if order.status == OrderStatus.FAILED:
             pos.exit_retries += 1
@@ -634,10 +1102,39 @@ class Trader:
                 )
                 return  # keep position open, retry next cycle
         elif order.status in (OrderStatus.OPEN, OrderStatus.PENDING):
-            logger.warning(
-                f"⏳ Exit order still open for {pos.market_id} [{reason}] — "
-                f"status={order.status.value}, no position change"
-            )
+            # Order sat on the book for 30s without filling — treat as a soft failure.
+            # Increment retry counter and lower price for next attempt so we eventually
+            # cross the spread and hit the bid.
+            pos.exit_retries += 1
+
+            if pos.exit_retries >= max_retries:
+                logger.warning(
+                    f"🚨 Exit order unfilled after {max_retries} cycles for {pos.market_id} [{reason}] — "
+                    f"marking force_close_failed"
+                )
+                pos.force_close_failed = True
+                pos.exit_price_override = 0.0  # reset so next attempt uses best bid
+                self.positions._save_state()
+                self._add_cooldown(pos.market_id)
+                return
+
+            # After half the retries, escalate: drop the conservative pricing
+            # and switch to best bid to force a fill.
+            if pos.exit_retries >= max_retries // 2:
+                pos.exit_price_override = 0.0  # reset → next cycle will use best bid
+                logger.warning(
+                    f"⏳ Exit escalated for {pos.market_id} [{reason}] — "
+                    f"retry {pos.exit_retries}/{max_retries}, switching to best bid"
+                )
+            else:
+                new_price = round(sell_price - price_step, 4)
+                pos.exit_price_override = max(new_price, 0.01)
+                logger.warning(
+                    f"⏳ Exit order unfilled for {pos.market_id} [{reason}] — "
+                    f"retry {pos.exit_retries}/{max_retries}, "
+                    f"next attempt @ ${pos.exit_price_override:.4f}"
+                )
+            self.positions._save_state()
             return
         elif order.status == OrderStatus.PARTIALLY_FILLED:
             logger.warning(
@@ -718,6 +1215,15 @@ class Trader:
             neg_risk = bool(neg_info and neg_info.get("neg_risk"))
 
             redeemed = self.redeemer.redeem(pos.condition_id, neg_risk=neg_risk)
+
+            # Bug fix: if we WON but redeem returned 0 (tx failure / already redeemed),
+            # do NOT record -100% loss — instead treat as pending redemption and skip close.
+            if won and redeemed == 0:
+                logger.warning(
+                    f"⚠️  {pos.market_id} WON but redeem returned $0 — "
+                    f"skipping close, will retry next cycle"
+                )
+                continue
 
             # Close position in tracker
             pnl = redeemed - pos.size_usdc if won else -pos.size_usdc
