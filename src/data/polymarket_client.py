@@ -213,14 +213,19 @@ class PolymarketClient:
             return _MOCK_MARKETS[:limit]
 
         try:
+            # NOTE: Gamma API's "active" parameter is BROKEN — it returns
+            # closed/resolved markets regardless.  Use "closed=false" instead,
+            # which actually filters correctly.
+            params = {
+                "limit": limit,
+                "order": "volume24hr",
+                "ascending": False,
+            }
+            if active_only:
+                params["closed"] = False  # closed=false = only open markets
             data = await self._get_json(
                 f"{self.GAMMA_API}/markets",
-                params={
-                    "limit": limit,
-                    "active": active_only,
-                    "order": "volume24hr",
-                    "ascending": False,
-                },
+                params=params,
             )
         except Exception as e:
             logger.error(f"Failed to fetch markets: {e}")
@@ -228,10 +233,16 @@ class PolymarketClient:
 
         markets = []
         banned_count = 0
+        resolved_count = 0
         for item in data if isinstance(data, list) else []:
             try:
                 market = self._parse_market(item)
                 if not market or market.volume_24h < min_volume:
+                    continue
+                # FILTER: Skip resolved markets (no point trading them)
+                if market.status == MarketStatus.RESOLVED:
+                    logger.debug(f"🏁 Skipped resolved market: {market.question[:60]}")
+                    resolved_count += 1
                     continue
                 if is_banned_market(market.question, market.sports_market_type):
                     logger.debug(
@@ -244,7 +255,10 @@ class PolymarketClient:
             except Exception as e:
                 logger.debug(f"Skipping unparseable market: {e}")
 
-        logger.info(f"📊 Fetched {len(markets)} markets from Polymarket (skipped {banned_count} sports/esports)")
+        logger.info(
+            f"📊 Fetched {len(markets)} markets from Polymarket "
+            f"(skipped {banned_count} sports/esports, {resolved_count} resolved)"
+        )
         return markets
 
     async def get_market(self, market_id: str) -> Market | None:
@@ -416,19 +430,34 @@ class PolymarketClient:
             return []
 
     async def get_market_by_condition(self, condition_id: str) -> Market | None:
-        """Fetch a market by its condition ID via Gamma API."""
+        """Fetch a market by its condition ID via Gamma API.
+
+        NOTE: The Gamma API's `conditionId` query parameter is BROKEN —
+        it ignores the value and returns all markets sorted by ID.
+        We must fetch by market ID or token ID instead.
+        This method is kept for backward compatibility but will likely
+        return None.  Prefer get_market() or get_market_by_token().
+        """
+        logger.warning(
+            f"get_market_by_condition({condition_id[:20]}...) called — "
+            f"Gamma API conditionId filter is broken, result may be wrong"
+        )
+        return None
+
+    async def get_market_by_token(self, token_id: str) -> Market | None:
+        """Fetch a market by its CLOB token ID via Gamma API."""
         if self.mock:
             return None
         try:
             data = await self._get_json(
                 f"{self.GAMMA_API}/markets",
-                params={"conditionId": condition_id},
+                params={"clob_token_ids": token_id},
             )
             items = data if isinstance(data, list) else []
             if items:
                 return self._parse_market(items[0])
         except Exception as e:
-            logger.warning(f"Failed to fetch market by condition {condition_id}: {e}")
+            logger.warning(f"Failed to fetch market by token {token_id[:16]}...: {e}")
         return None
 
     # ─── Helpers ──────────────────────────────────────────────

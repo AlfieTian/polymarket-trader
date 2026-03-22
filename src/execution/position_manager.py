@@ -213,12 +213,16 @@ class PositionManager:
         self,
         current_prices: dict[str, float],
         current_p_hats: dict[str, float],
+        skip_edge_reversal: bool = False,
     ) -> list[ExitSignal]:
         """Check all positions for exit conditions.
 
         Args:
             current_prices: {market_id → current YES price}
             current_p_hats: {market_id → current Bayesian estimate}
+            skip_edge_reversal: If True, skip edge-reversal checks (use for
+                fast-path exit checks before LLM signals are updated, to avoid
+                false edge-reversal triggers on uninitialized beliefs).
 
         Returns:
             List of ExitSignals for positions that should be closed
@@ -279,7 +283,7 @@ class PositionManager:
                 )
 
             # 3. Edge reversal (our model no longer agrees with this position)
-            elif p_hat is not None:
+            elif not skip_edge_reversal and p_hat is not None:
                 if pos.side == "YES":
                     current_edge = p_hat - effective_price
                 else:

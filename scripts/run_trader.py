@@ -257,6 +257,7 @@ class Trader:
             "market_price": opp.market_price,
             "end_date": market.end_date,
             "created_at": time.time(),
+            "recorded_filled_size": 0.0,
         })
         self._save_pending_orders()
         logger.info(f"📋 Pending order saved: {opp.market_id} {opp.side} order_id={order_id}")
@@ -264,7 +265,12 @@ class Trader:
     def _check_pending_orders(self) -> None:
         """Check all pending orders for fills; record positions or cancel stale ones."""
         if not self._pending_orders:
+            # Reset the recently-confirmed token set at start of each cycle
+            self._recently_confirmed_tokens = set()
             return
+
+        # Track tokens that are newly confirmed in this cycle (for phantom-discovery exclusion)
+        self._recently_confirmed_tokens = set()
 
         remaining = []
         for po in self._pending_orders:
@@ -284,7 +290,12 @@ class Trader:
 
             if order.status in (OS.FILLED, OS.PARTIALLY_FILLED) and order.filled_size > 0:
                 avg_price = order.filled_avg_price or po["entry_price"]
-                actual_size = order.filled_size
+                recorded_filled_size = float(po.get("recorded_filled_size", 0.0) or 0.0)
+                actual_size = max(0.0, order.filled_size - recorded_filled_size)
+                if actual_size < 0.01:
+                    if order.status == OS.PARTIALLY_FILLED:
+                        remaining.append(po)
+                    continue
                 actual_size_usdc = round(actual_size * avg_price, 4)
 
                 position = Position(
@@ -302,6 +313,9 @@ class Trader:
                 self.positions.add_position(position)
                 self.risk.record_position(po["market_id"], actual_size_usdc)
                 self.kelly.record_position(po["market_id"], actual_size_usdc)
+                # Mark this token as recently confirmed to prevent phantom-discovery
+                # from adding it again during this reconcile window
+                self._recently_confirmed_tokens.add(po["token_id"])
 
                 fill_type = "fully" if order.status == OS.FILLED else "partially"
                 logger.info(
@@ -311,7 +325,8 @@ class Trader:
 
                 # If partially filled, keep tracking the remainder
                 if order.status == OS.PARTIALLY_FILLED:
-                    po["size"] = po["size"] - actual_size
+                    po["size"] = max(0.0, po["size"] - actual_size)
+                    po["recorded_filled_size"] = order.filled_size
                     remaining.append(po)
                 continue
 
@@ -321,11 +336,57 @@ class Trader:
 
             # Still open — check age
             if age_s > self._pending_order_max_age_s:
+                # Before cancelling, check if the order partially filled on-chain
+                # (CLOB status can lag behind on-chain settlement).
+                onchain_bal = self.executor._onchain_token_balance(po["token_id"])
+                if onchain_bal != float("inf") and onchain_bal >= 0.01:
+                    # Tokens appeared on-chain — the order DID fill (at least partially).
+                    # Record the position from on-chain truth instead of cancelling.
+                    avg_price = po["entry_price"]
+                    actual_size = onchain_bal
+                    # Subtract any pre-existing position size for this token
+                    existing_pos = self.positions.get_position(po["market_id"])
+                    if existing_pos:
+                        actual_size = onchain_bal - existing_pos.size
+                    if actual_size >= 0.01:
+                        actual_size_usdc = round(actual_size * avg_price, 4)
+                        position = Position(
+                            market_id=po["market_id"],
+                            condition_id=po["condition_id"],
+                            token_id=po["token_id"],
+                            side=po["side"],
+                            entry_price=avg_price,
+                            size=actual_size,
+                            size_usdc=actual_size_usdc,
+                            p_hat_at_entry=po["p_hat"],
+                            market_price_at_entry=po["market_price"],
+                            end_date=po.get("end_date", ""),
+                        )
+                        self.positions.add_position(position)
+                        self.risk.record_position(po["market_id"], actual_size_usdc)
+                        self.kelly.record_position(po["market_id"], actual_size_usdc)
+                        self._recently_confirmed_tokens.add(po["token_id"])
+                        logger.info(
+                            f"✅ Pending order {order_id} {po['market_id']} filled on-chain: "
+                            f"{actual_size:.2f} shares @ ${avg_price:.3f} "
+                            f"(CLOB status lagged, detected via on-chain balance)"
+                        )
+                    else:
+                        logger.info(
+                            f"✅ Pending order {order_id} {po['market_id']} already fully "
+                            f"accounted for via earlier partial fills; cancelling remainder"
+                        )
+                    # Cancel any remaining unfilled portion
+                    self.executor.cancel_order(order_id)
+                    continue
+
                 logger.warning(
                     f"⏰ Pending order {order_id} {po['market_id']} expired after "
                     f"{age_s:.0f}s — cancelling"
                 )
                 self.executor.cancel_order(order_id)
+                # Add exit cooldown to prevent immediate re-entry for the same market.
+                self._add_exit_cooldown(po["market_id"])
                 continue
 
             # Still pending, keep tracking
@@ -387,8 +448,8 @@ class Trader:
             try:
                 market = await self.client.get_market(pos.market_id)
                 if market is None:
-                    # Fallback: try by condition_id
-                    market = await self.client.get_market_by_condition(pos.condition_id)
+                    # Fallback: try by token_id (conditionId filter is broken on Gamma API)
+                    market = await self.client.get_market_by_token(pos.token_id)
                 if market:
                     prices[market.id] = market.yes_price
                     # Also add to market_map so _execute_exit can find token_id etc.
@@ -484,6 +545,14 @@ class Trader:
         # Also exclude tokens from pending orders (not yet confirmed)
         pending_tokens = {po.get("token_id", "") for po in self._pending_orders}
         tracked_tokens |= pending_tokens
+        # CRITICAL: Also exclude tokens that were just added in _check_pending_orders
+        # in this very cycle, to prevent phantom-discovery from double-adding them
+        # during the 30s on-chain settlement window.
+        # Without this, the same on-chain token gets added twice: once as a normal
+        # position from pending order fill, then again as a "phantom" position from
+        # the on-chain discovery scan, causing 2x position size and rapid buy-sell loops.
+        recently_confirmed_tokens = getattr(self, "_recently_confirmed_tokens", set())
+        tracked_tokens |= recently_confirmed_tokens
 
         try:
             remote_positions = await self.client.get_wallet_positions(self._wallet_address)
@@ -521,6 +590,11 @@ class Trader:
             if side not in ("YES", "NO"):
                 side = "YES"
 
+            # Skip if this market is in exit cooldown (recently closed/zombie-cleaned)
+            if self._in_exit_cooldown(market_id):
+                logger.debug(f"⏭️  Skipping phantom {token_id[:16]}... — exit cooldown active")
+                continue
+
             # Try to get entry price from the API position data
             avg_price = float(rp.get("avgPrice", 0) or 0)
             if avg_price <= 0:
@@ -531,14 +605,30 @@ class Trader:
 
             size_usdc = round(onchain_size * avg_price, 4)
 
-            # Fetch market metadata if we have a condition_id
+            # Fetch market metadata by token_id (conditionId filter is broken on Gamma API)
             end_date = ""
-            if condition_id:
+            if token_id:
                 try:
-                    market_info = await self.client.get_market_by_condition(condition_id)
+                    market_info = await self.client.get_market_by_token(token_id)
                     if market_info:
                         market_id = market_info.id or market_id
                         end_date = market_info.end_date or ""
+                except Exception:
+                    pass
+
+            # Skip phantom positions whose end_date is >48h in the past
+            # (zombie markets — tokens are worthless or already redeemed)
+            if end_date:
+                try:
+                    from datetime import datetime, timezone
+                    end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    hours_past = (datetime.now(timezone.utc) - end_dt).total_seconds() / 3600
+                    if hours_past > 48:
+                        logger.info(
+                            f"⏭️  Skipping phantom {token_id[:16]}... — "
+                            f"end_date {end_date} is {hours_past:.0f}h in the past (zombie)"
+                        )
+                        continue
                 except Exception:
                     pass
 
@@ -594,12 +684,35 @@ class Trader:
         """Clean up crash leftovers before trading resumes.
 
         Reconciliation steps:
+        0. Remove zombie positions whose end_date has long passed.
         1. Cancel remote live orders left behind by a crashed process.
         2. Sync CLOB collateral balances.
         3. Reconcile persisted positions against on-chain token balances.
         4. Rebuild in-memory risk/Kelly exposure from the reconciled state.
         """
         logger.info("🩺 Startup reconciliation begin")
+
+        # ── Step 0: Remove zombie positions (end_date far in the past) ────
+        # Markets whose resolution date is >48h in the past are almost certainly
+        # resolved.  Keeping them causes token-collision bugs when the same token
+        # ID is reused by a newer market (Polymarket reuses CTF token IDs across
+        # markets/conditions).
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        for pos in list(self.positions.open_positions):
+            if pos.end_date:
+                try:
+                    end_dt = datetime.fromisoformat(pos.end_date.replace("Z", "+00:00"))
+                    hours_past = (now - end_dt).total_seconds() / 3600
+                    if hours_past > 48:
+                        logger.warning(
+                            f"🧟 Removing zombie position {pos.market_id} — "
+                            f"end_date {pos.end_date} is {hours_past:.0f}h in the past"
+                        )
+                        self.positions.close_position(pos.market_id)
+                        self._add_exit_cooldown(pos.market_id)
+                except Exception:
+                    pass
 
         # Check any pending orders from last session before cancelling
         if self._pending_orders:
@@ -723,7 +836,9 @@ class Trader:
         # (e.g. low volume, fell out of top 100). Without this, exits never trigger.
         await self._ensure_position_prices(current_prices_fast, market_map)
 
-        for exit_sig in self.positions.check_exits(current_prices_fast, current_p_hats_fast):
+        for exit_sig in self.positions.check_exits(
+            current_prices_fast, current_p_hats_fast, skip_edge_reversal=True
+        ):
             await self._execute_exit(
                 exit_sig.position, exit_sig.current_price, market_map, exit_sig.reason.value
             )
@@ -780,9 +895,17 @@ class Trader:
         if not opportunities:
             logger.info("😴 No edge this cycle")
         else:
+            # Build set of markets with pending buy orders to prevent duplicate entries
+            pending_market_ids = {po["market_id"] for po in self._pending_orders}
+
             for opp in opportunities:
                 # Skip if already have a position in this market
                 if self.positions.get_position(opp.market_id):
+                    continue
+
+                # Skip if a buy order is already pending for this market
+                if opp.market_id in pending_market_ids:
+                    logger.debug(f"⏳ {opp.market_id} skipped — pending buy order exists")
                     continue
 
                 # Skip if market is in force-close cooldown
@@ -1211,10 +1334,12 @@ class Trader:
             )
 
             # Determine if this is a neg_risk market via redeemer's gamma API lookup
-            neg_info = self.redeemer._lookup_neg_risk_info(pos.condition_id)
+            neg_info = self.redeemer._lookup_neg_risk_info(pos.condition_id, token_id=pos.token_id)
             neg_risk = bool(neg_info and neg_info.get("neg_risk"))
 
-            redeemed = self.redeemer.redeem(pos.condition_id, neg_risk=neg_risk)
+            redeemed = self.redeemer.redeem(
+                pos.condition_id, neg_risk=neg_risk, token_id=pos.token_id
+            )
 
             # Bug fix: if we WON but redeem returned 0 (tx failure / already redeemed),
             # do NOT record -100% loss — instead treat as pending redemption and skip close.

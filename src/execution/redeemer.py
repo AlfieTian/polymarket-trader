@@ -92,23 +92,41 @@ class Redeemer:
             logger.debug(f"getDetermined failed for {question_id}: {e}")
             return False
 
-    def _lookup_neg_risk_info(self, condition_id: str) -> dict | None:
-        """Query gamma API to get neg_risk metadata for a market."""
-        try:
-            url = f"https://gamma-api.polymarket.com/markets?conditionId={condition_id}"
-            data = json.loads(urllib.request.urlopen(url, timeout=10).read())
-            if data and isinstance(data, list) and data[0].get("negRisk"):
-                return {
-                    "neg_risk": True,
-                    "question_id": data[0].get("questionID", ""),
-                    "neg_risk_market_id": data[0].get("negRiskMarketID", ""),
-                    "question": data[0].get("question", ""),
-                }
-        except Exception as e:
-            logger.debug(f"Gamma API lookup failed for {condition_id}: {e}")
+    def _lookup_neg_risk_info(self, condition_id: str, token_id: str = "") -> dict | None:
+        """Check if a market uses NegRisk via CLOB API.
+
+        NOTE: The Gamma API conditionId filter is broken (returns unrelated markets).
+        We use the CLOB /neg-risk endpoint instead, which works correctly.
+        Falls back to Gamma API /markets?clob_token_ids= if token_id is provided.
+        """
+        # Method 1: CLOB /neg-risk (fast, reliable)
+        if token_id:
+            try:
+                url = f"https://clob.polymarket.com/neg-risk?token_id={token_id}"
+                data = json.loads(urllib.request.urlopen(url, timeout=10).read())
+                if data.get("neg_risk"):
+                    return {"neg_risk": True}
+            except Exception as e:
+                logger.debug(f"CLOB neg-risk check failed for {token_id[:16]}...: {e}")
+
+        # Method 2: Gamma API by token_id (if available)
+        if token_id:
+            try:
+                url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
+                data = json.loads(urllib.request.urlopen(url, timeout=10).read())
+                if data and isinstance(data, list) and data[0].get("negRisk"):
+                    return {
+                        "neg_risk": True,
+                        "question_id": data[0].get("questionID", ""),
+                        "neg_risk_market_id": data[0].get("negRiskMarketID", ""),
+                        "question": data[0].get("question", ""),
+                    }
+            except Exception as e:
+                logger.debug(f"Gamma API token lookup failed for {token_id[:16]}...: {e}")
+
         return None
 
-    def can_redeem(self, condition_id: str) -> tuple[bool, bool]:
+    def can_redeem(self, condition_id: str, token_id: str = "") -> tuple[bool, bool]:
         """Check if a position can be redeemed.
         
         Returns (redeemable, is_neg_risk).
@@ -120,7 +138,7 @@ class Redeemer:
             return False, False
 
         # Check if it's a neg_risk market
-        neg_info = self._lookup_neg_risk_info(condition_id)
+        neg_info = self._lookup_neg_risk_info(condition_id, token_id=token_id)
         if neg_info and neg_info["neg_risk"]:
             qid = neg_info.get("question_id", "")
             if qid:
@@ -134,7 +152,7 @@ class Redeemer:
 
         return True, False
 
-    def _get_neg_risk_token_balances(self, condition_id: str) -> tuple[int, int]:
+    def _get_neg_risk_token_balances(self, condition_id: str, token_id: str = "") -> tuple[int, int]:
         """Query on-chain CTF balances for YES and NO tokens of a NegRisk market.
 
         Uses NegRiskAdapter.getPositionId to derive token IDs, then checks
@@ -145,7 +163,7 @@ class Redeemer:
         """
         try:
             # Look up questionID from gamma API
-            neg_info = self._lookup_neg_risk_info(condition_id)
+            neg_info = self._lookup_neg_risk_info(condition_id, token_id=token_id)
             if not neg_info or not neg_info.get("question_id"):
                 logger.warning(f"Cannot find questionID for {condition_id[:16]}...")
                 return 0, 0
@@ -166,7 +184,7 @@ class Redeemer:
             logger.error(f"Failed to get NegRisk token balances: {e}")
             return 0, 0
 
-    def redeem(self, condition_id: str, neg_risk: bool = False) -> float:
+    def redeem(self, condition_id: str, neg_risk: bool = False, token_id: str = "") -> float:
         """Redeem resolved position. Returns USDC.e amount redeemed."""
         bal_before = self.usdc.functions.balanceOf(self.wallet).call()
         cid_bytes = bytes.fromhex(condition_id.replace("0x", ""))
@@ -178,7 +196,7 @@ class Redeemer:
             if neg_risk:
                 # NegRiskAdapter.redeemPositions(conditionId, amounts)
                 # amounts = [yes_amount, no_amount] in raw token units
-                yes_bal, no_bal = self._get_neg_risk_token_balances(condition_id)
+                yes_bal, no_bal = self._get_neg_risk_token_balances(condition_id, token_id=token_id)
                 if yes_bal == 0 and no_bal == 0:
                     logger.info(f"No tokens to redeem for {condition_id[:16]}...")
                     return 0.0
@@ -226,7 +244,7 @@ class Redeemer:
                 # Try the other method if first one failed
                 if not neg_risk:
                     logger.debug(f"Standard redeem reverted, trying NegRisk adapter...")
-                    return self.redeem(condition_id, neg_risk=True)
+                    return self.redeem(condition_id, neg_risk=True, token_id=token_id)
                 logger.warning(f"⚠️ Redeem reverted for {condition_id[:16]}...")
                 return 0.0
 
@@ -249,16 +267,18 @@ class Redeemer:
             if not cid:
                 continue
 
-            redeemable, is_neg_risk = self.can_redeem(cid)
+            token_id = pos.get("token_id", "")
+            redeemable, is_neg_risk = self.can_redeem(cid, token_id=token_id)
             if not redeemable:
                 continue
 
             market_id = pos.get("market_id", cid[:16])
             logger.info(f"🔄 Attempting redemption for {market_id} (neg_risk={is_neg_risk})")
-            amount = self.redeem(cid, neg_risk=is_neg_risk)
+            amount = self.redeem(cid, neg_risk=is_neg_risk, token_id=token_id)
             results.append({
                 "market_id": market_id,
                 "condition_id": cid,
+                "token_id": token_id,
                 "amount": amount,
                 "neg_risk": is_neg_risk,
             })
