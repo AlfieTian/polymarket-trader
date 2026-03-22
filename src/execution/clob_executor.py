@@ -406,7 +406,7 @@ class CLOBExecutor:
             return result
         except Exception as e:
             logger.warning(f"Could not fetch market meta for {condition_id}: {e}, using defaults")
-            return {"tick_size": "0.01", "neg_risk": False}
+            return {"tick_size": "0.01", "neg_risk": False, "min_order_size": 5}
 
     def _snap_price(self, price: float, tick_size: str) -> float:
         """Snap price to valid tick size increment."""
