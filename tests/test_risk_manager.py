@@ -57,3 +57,19 @@ def test_daily_risk_state_resets_on_new_day(tmp_path, monkeypatch):
     persisted = json.loads(state_file.read_text())
     assert persisted["daily_pnl"] == 0.0
     assert persisted["halted"] is False
+
+
+def test_set_position_replaces_existing_market_exposure(tmp_path, monkeypatch):
+    state_file = tmp_path / "risk_state.json"
+    history_file = tmp_path / "trade_history.json"
+    history_file.write_text("[]")
+
+    monkeypatch.setattr(risk_module, "_RISK_STATE_FILE", state_file)
+    monkeypatch.setattr(risk_module, "_TRADE_HISTORY_FILE", history_file)
+
+    rm = RiskManager(max_daily_loss_usdc=50)
+    rm.record_position("m1", 10.0)
+    assert rm.total_exposure == 10.0
+
+    rm.set_position("m1", 6.0)
+    assert rm.total_exposure == 6.0

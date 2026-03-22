@@ -27,11 +27,15 @@ class _DummyPositions:
 class _DummyExposure:
     def __init__(self):
         self.recorded = []
+        self.set_calls = []
         self.closed = []
         self.pnl = []
 
     def record_position(self, market_id: str, size_usdc: float):
         self.recorded.append((market_id, size_usdc))
+
+    def set_position(self, market_id: str, size_usdc: float):
+        self.set_calls.append((market_id, size_usdc))
 
     def close_position(self, market_id: str):
         self.closed.append(market_id)
@@ -153,6 +157,41 @@ class _DummyExitExecutor:
 
     def _sync_clob_balance(self):
         self.synced += 1
+
+
+def test_execute_exit_partial_fill_updates_remaining_exposure():
+    trader = Trader.__new__(Trader)
+    trader.positions = _DummyExitPositions()
+    trader.risk = _DummyExposure()
+    trader.kelly = _DummyExposure()
+    trader.perf = _DummyPerf()
+    trader.executor = _DummyExitExecutor(
+        OrderStatus.PARTIALLY_FILLED, filled_size=4.0, filled_avg_price=0.72
+    )
+    trader._add_exit_cooldown = lambda market_id: None
+    trader._strat_cfg = {}
+    trader.edge_detector = object()
+
+    pos = Position(
+        market_id="m1",
+        condition_id="c1",
+        token_id="t1",
+        side="YES",
+        entry_price=0.50,
+        size=10.0,
+        size_usdc=5.0,
+        p_hat_at_entry=0.55,
+        market_price_at_entry=0.50,
+    )
+
+    asyncio.run(trader._execute_exit(pos, current_price=0.80, market_map={}, reason="profit_target"))
+
+    assert pos.size == 6.0
+    assert pos.size_usdc == 3.0
+    assert trader.risk.set_calls == [("m1", 3.0)]
+    assert trader.kelly.set_calls == [("m1", 3.0)]
+    assert trader.risk.pnl == [pytest.approx(0.88)]
+    assert trader.perf.closed == []
 
 
 def test_execute_exit_records_actual_fill_price_in_trade_history():

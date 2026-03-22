@@ -71,3 +71,9 @@ class TestKellySizer:
             KellySizer(kelly_fraction=0)
         with pytest.raises(ValueError):
             KellySizer(kelly_fraction=-0.5)
+
+    def test_set_position_replaces_existing_market_exposure(self):
+        sizer = KellySizer()
+        sizer.record_position("m1", 5.0)
+        sizer.set_position("m1", 3.0)
+        assert sizer.total_exposure == 3.0

@@ -248,6 +248,18 @@ class RiskManager:
             f"portfolio: ${self.total_exposure:.2f})"
         )
 
+    def set_position(self, market_id: str, size_usdc: float) -> None:
+        """Set the tracked exposure for a market to an exact amount."""
+        if size_usdc <= 0:
+            self.close_position(market_id)
+            return
+        old_size = self._positions.get(market_id, 0.0)
+        self._positions[market_id] = size_usdc
+        logger.info(
+            f"Position updated: {market_id} ${old_size:.2f}→${size_usdc:.2f} "
+            f"(portfolio: ${self.total_exposure:.2f})"
+        )
+
     def close_position(self, market_id: str) -> None:
         """Remove a market from position tracking."""
         removed = self._positions.pop(market_id, 0)

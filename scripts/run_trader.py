@@ -680,6 +680,11 @@ class Trader:
             self.risk.record_position(pos.market_id, pos.size_usdc)
             self.kelly.record_position(pos.market_id, pos.size_usdc)
 
+    def _set_portfolio_exposure(self, market_id: str, size_usdc: float) -> None:
+        """Keep RiskManager and KellySizer aligned with the current position size."""
+        self.risk.set_position(market_id, size_usdc)
+        self.kelly.set_position(market_id, size_usdc)
+
     def _reconcile_startup_state(self) -> None:
         """Clean up crash leftovers before trading resumes.
 
@@ -1273,6 +1278,7 @@ class Trader:
                 pos.size_usdc = round(pos.size_usdc * scale, 4)
                 pos.exit_retries = 0
                 pos.exit_price_override = 0.0
+                self._set_portfolio_exposure(pos.market_id, pos.size_usdc)
                 self.positions._save_state()
                 logger.warning(
                     f"⚠️  Exit partially filled for {pos.market_id} [{reason}] — "

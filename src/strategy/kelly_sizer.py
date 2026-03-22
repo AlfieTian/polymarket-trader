@@ -177,6 +177,13 @@ class KellySizer:
             self._current_exposure.get(market_id, 0) + usdc
         )
 
+    def set_position(self, market_id: str, usdc: float) -> None:
+        """Set the tracked exposure for a market to an exact amount."""
+        if usdc <= 0:
+            self.close_position(market_id)
+            return
+        self._current_exposure[market_id] = usdc
+
     def close_position(self, market_id: str) -> None:
         """Remove a market from exposure tracking."""
         self._current_exposure.pop(market_id, None)
