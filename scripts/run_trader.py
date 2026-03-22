@@ -1260,15 +1260,35 @@ class Trader:
             self.positions._save_state()
             return
         elif order.status == OrderStatus.PARTIALLY_FILLED:
-            logger.warning(
-                f"⚠️  Exit partially filled for {pos.market_id} [{reason}] — "
-                f"{order.filled_size:.2f}/{pos.size:.2f} shares. "
-                f"Position retained for manual reconciliation."
-            )
+            filled = order.filled_size if order.filled_size > 0 else 0
+            avg_price = order.filled_avg_price if order.filled_avg_price > 0 else sell_price
+            if filled > 0 and filled < pos.size:
+                # Record partial PnL
+                partial_pnl = (avg_price - pos.entry_price) * filled
+                self.risk.record_pnl(partial_pnl)
+                # Reduce position size to remaining unfilled portion
+                remaining = pos.size - filled
+                scale = remaining / pos.size if pos.size > 0 else 1.0
+                pos.size = round(remaining, 6)
+                pos.size_usdc = round(pos.size_usdc * scale, 4)
+                pos.exit_retries = 0
+                pos.exit_price_override = 0.0
+                self.positions._save_state()
+                logger.warning(
+                    f"⚠️  Exit partially filled for {pos.market_id} [{reason}] — "
+                    f"{filled:.2f} sold @ ${avg_price:.3f}, "
+                    f"remaining {pos.size:.2f} shares (${pos.size_usdc:.2f} USDC)"
+                )
+            else:
+                logger.warning(
+                    f"⚠️  Exit partially filled for {pos.market_id} [{reason}] — "
+                    f"{order.filled_size:.2f}/{sell_size:.2f} shares, no size update"
+                )
             return
 
-        effective_price = sell_price
-        pnl = (effective_price - pos.entry_price) * pos.size
+        effective_price = order.filled_avg_price if order.filled_avg_price > 0 else sell_price
+        actual_exit_size = order.filled_size if order.filled_size > 0 else pos.size
+        pnl = (effective_price - pos.entry_price) * actual_exit_size
         pnl_pct = (effective_price - pos.entry_price) / pos.entry_price if pos.entry_price else 0
         self.risk.record_pnl(pnl)
         self.positions.close_position(pos.market_id)
