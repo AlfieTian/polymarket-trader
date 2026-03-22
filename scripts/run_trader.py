@@ -1288,6 +1288,7 @@ class Trader:
 
         effective_price = order.filled_avg_price if order.filled_avg_price > 0 else sell_price
         actual_exit_size = order.filled_size if order.filled_size > 0 else pos.size
+        closed_size_usdc = pos.size_usdc
         pnl = (effective_price - pos.entry_price) * actual_exit_size
         pnl_pct = (effective_price - pos.entry_price) / pos.entry_price if pos.entry_price else 0
         self.risk.record_pnl(pnl)
@@ -1302,7 +1303,7 @@ class Trader:
         logger.info(
             f"🚪 Closed {pos.market_id} {pos.side} [{reason}] — "
             f"PnL: ${pnl:+.2f} ({pnl_pct:+.1%}) | "
-            f"entry=${pos.entry_price:.3f} exit=${current_price:.3f}"
+            f"entry=${pos.entry_price:.3f} exit=${effective_price:.3f}"
         )
 
         # Record to performance tracker
@@ -1310,8 +1311,8 @@ class Trader:
             market_id=pos.market_id,
             side=pos.side,
             entry_price=pos.entry_price,
-            exit_price=current_price,
-            size_usdc=pos.size_usdc,
+            exit_price=effective_price,
+            size_usdc=closed_size_usdc,
             realized_pnl=round(pnl, 4),
             realized_pnl_pct=round(pnl_pct, 4),
             exit_reason=reason,
@@ -1371,7 +1372,8 @@ class Trader:
                 continue
 
             # Close position in tracker
-            pnl = redeemed - pos.size_usdc if won else -pos.size_usdc
+            closed_size_usdc = pos.size_usdc
+            pnl = redeemed - closed_size_usdc if won else -closed_size_usdc
             self.risk.record_pnl(pnl)
             self.positions.close_position(pos.market_id)
             self.risk.close_position(pos.market_id)
@@ -1385,9 +1387,9 @@ class Trader:
                 side=pos.side,
                 entry_price=pos.entry_price,
                 exit_price=exit_price,
-                size_usdc=pos.size_usdc,
+                size_usdc=closed_size_usdc,
                 realized_pnl=round(pnl, 4),
-                realized_pnl_pct=round(pnl / pos.size_usdc, 4) if pos.size_usdc else 0,
+                realized_pnl_pct=round(pnl / closed_size_usdc, 4) if closed_size_usdc else 0,
                 exit_reason="resolution",
             )
             self.perf.record_close(trade)
