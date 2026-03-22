@@ -49,3 +49,30 @@ def test_check_and_redeem_all_passes_token_id(monkeypatch):
         "amount": 12.5,
         "neg_risk": True,
     }]
+
+
+def test_lookup_neg_risk_info_enriches_clob_hit_with_gamma_question_id(monkeypatch):
+    redeemer = Redeemer.__new__(Redeemer)
+
+    def fake_urlopen_json(url: str, timeout: int = 10):
+        if "clob.polymarket.com/neg-risk" in url:
+            return {"neg_risk": True}
+        if "gamma-api.polymarket.com/markets" in url:
+            return [{
+                "negRisk": True,
+                "questionID": "0x01",
+                "negRiskMarketID": "nr-1",
+                "question": "Example market",
+            }]
+        return None
+
+    monkeypatch.setattr(Redeemer, "_urlopen_json", staticmethod(fake_urlopen_json))
+
+    result = redeemer._lookup_neg_risk_info("cid-1", token_id="tok-1")
+
+    assert result == {
+        "neg_risk": True,
+        "question_id": "0x01",
+        "neg_risk_market_id": "nr-1",
+        "question": "Example market",
+    }

@@ -16,11 +16,7 @@ import json
 import logging
 import os
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-
-# Shared thread pool for non-blocking HTTP lookups from sync methods
-_http_pool = ThreadPoolExecutor(max_workers=2)
 
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
@@ -98,7 +94,7 @@ class Redeemer:
 
     @staticmethod
     def _urlopen_json(url: str, timeout: int = 10) -> dict | list | None:
-        """Sync HTTP GET that returns parsed JSON, used inside thread pool."""
+        """Sync HTTP GET that returns parsed JSON."""
         try:
             return json.loads(urllib.request.urlopen(url, timeout=timeout).read())
         except Exception:
@@ -110,39 +106,37 @@ class Redeemer:
         NOTE: The Gamma API conditionId filter is broken (returns unrelated markets).
         We use the CLOB /neg-risk endpoint instead, which works correctly.
         Falls back to Gamma API /markets?clob_token_ids= if token_id is provided.
-
-        Uses a thread pool to avoid blocking the async event loop.
         """
-        import concurrent.futures
+        base_info = None
 
         # Method 1: CLOB /neg-risk (fast, reliable)
         if token_id:
             try:
                 url = f"https://clob.polymarket.com/neg-risk?token_id={token_id}"
-                future = _http_pool.submit(self._urlopen_json, url)
-                data = future.result(timeout=12)
+                data = self._urlopen_json(url, timeout=10)
                 if data and isinstance(data, dict) and data.get("neg_risk"):
-                    return {"neg_risk": True}
+                    base_info = {"neg_risk": True}
             except Exception as e:
                 logger.debug(f"CLOB neg-risk check failed for {token_id[:16]}...: {e}")
 
-        # Method 2: Gamma API by token_id (if available)
+        # Method 2: Gamma API by token_id for questionID enrichment
         if token_id:
             try:
                 url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
-                future = _http_pool.submit(self._urlopen_json, url)
-                data = future.result(timeout=12)
-                if data and isinstance(data, list) and data[0].get("negRisk"):
-                    return {
-                        "neg_risk": True,
-                        "question_id": data[0].get("questionID", ""),
-                        "neg_risk_market_id": data[0].get("negRiskMarketID", ""),
-                        "question": data[0].get("question", ""),
-                    }
+                data = self._urlopen_json(url, timeout=10)
+                if data and isinstance(data, list):
+                    item = data[0]
+                    if item.get("negRisk") or base_info:
+                        return {
+                            "neg_risk": True,
+                            "question_id": item.get("questionID", ""),
+                            "neg_risk_market_id": item.get("negRiskMarketID", ""),
+                            "question": item.get("question", ""),
+                        }
             except Exception as e:
                 logger.debug(f"Gamma API token lookup failed for {token_id[:16]}...: {e}")
 
-        return None
+        return base_info
 
     def can_redeem(self, condition_id: str, token_id: str = "") -> tuple[bool, bool]:
         """Check if a position can be redeemed.

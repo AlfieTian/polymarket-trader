@@ -998,7 +998,7 @@ class Trader:
         # ─── 6. Auto-redeem resolved positions ──────────────
         self._cycle_count += 1
         if self._cycle_count % self._redeem_interval_cycles == 0:
-            self._check_redemptions()
+            await self._check_redemptions()
             # After possible redemption, resync CLOB balance so freed
             # USDC.e is visible for the next entry attempt.
             self.executor._sync_clob_balance()
@@ -1340,10 +1340,10 @@ class Trader:
                 self.edge_detector.min_edge = new_params["min_edge"]
                 logger.info("✅ Strategy parameters updated in-memory")
 
-    def _check_redemptions(self) -> None:
+    async def _check_redemptions(self) -> None:
         """Check all open positions for on-chain resolution and auto-redeem."""
         for pos in list(self.positions.open_positions):
-            resolution = self.redeemer.is_resolved(pos.condition_id)
+            resolution = await asyncio.to_thread(self.redeemer.is_resolved, pos.condition_id)
             if resolution is None:
                 continue
 
@@ -1360,12 +1360,17 @@ class Trader:
                 f"(payout: YES={resolution['payout_yes']}, NO={resolution['payout_no']})"
             )
 
-            # Determine if this is a neg_risk market via redeemer's gamma API lookup
-            neg_info = self.redeemer._lookup_neg_risk_info(pos.condition_id, token_id=pos.token_id)
+            # Resolve neg-risk metadata off the event loop; redemption RPCs are also blocking.
+            neg_info = await asyncio.to_thread(
+                self.redeemer._lookup_neg_risk_info, pos.condition_id, pos.token_id
+            )
             neg_risk = bool(neg_info and neg_info.get("neg_risk"))
 
-            redeemed = self.redeemer.redeem(
-                pos.condition_id, neg_risk=neg_risk, token_id=pos.token_id
+            redeemed = await asyncio.to_thread(
+                self.redeemer.redeem,
+                pos.condition_id,
+                neg_risk,
+                pos.token_id,
             )
 
             # Bug fix: if we WON but redeem returned 0 (tx failure / already redeemed),
