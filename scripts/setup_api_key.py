@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-一键生成 Polymarket API 凭证
+One-click Polymarket API credential generation
 
-前提：在 .env 中填入 POLYMARKET_PRIVATE_KEY 和 POLYMARKET_WALLET_ADDRESS
-运行后会自动生成 API 凭证并写回 .env
+Prerequisites: fill in POLYMARKET_PRIVATE_KEY and POLYMARKET_WALLET_ADDRESS in .env
+Generates API credentials and writes them back to .env
 """
 
 import os
@@ -19,9 +19,9 @@ ENV_PATH = Path(__file__).parent.parent / ".env"
 
 def main():
     if not ENV_PATH.exists():
-        print("❌ .env 文件不存在")
-        print("   运行: cp .env.template .env")
-        print("   然后填入 POLYMARKET_PRIVATE_KEY 和 POLYMARKET_WALLET_ADDRESS")
+        print("Error: .env file not found")
+        print("   Run: cp .env.template .env")
+        print("   Then fill in POLYMARKET_PRIVATE_KEY and POLYMARKET_WALLET_ADDRESS")
         sys.exit(1)
 
     load_dotenv(ENV_PATH)
@@ -29,50 +29,50 @@ def main():
     wallet_address = os.getenv("POLYMARKET_WALLET_ADDRESS", "").strip()
 
     if not private_key:
-        print("❌ POLYMARKET_PRIVATE_KEY 为空")
-        print("   请在 .env 中填入你的 Polygon 钱包私钥")
+        print("Error: POLYMARKET_PRIVATE_KEY is empty")
+        print("   Please fill in your Polygon wallet private key in .env")
         sys.exit(1)
 
     if not wallet_address:
-        print("❌ POLYMARKET_WALLET_ADDRESS 为空")
-        print("   请在 .env 中填入你的钱包地址（0x...）")
+        print("Error: POLYMARKET_WALLET_ADDRESS is empty")
+        print("   Please fill in your wallet address (0x...) in .env")
         sys.exit(1)
 
-    print("🔑 正在通过 L1→L2 签名派生 API 凭证...")
-    print(f"   钱包地址: {wallet_address[:8]}...{wallet_address[-6:]}")
+    print("Deriving API credentials via L1->L2 signature...")
+    print(f"   Wallet: {wallet_address[:8]}...{wallet_address[-6:]}")
 
     try:
         from py_clob_client.client import ClobClient
 
-        # Step 1: 创建临时 client，派生 API 凭证
+        # Step 1: Create temporary client, derive API credentials
         temp_client = ClobClient(
             host="https://clob.polymarket.com",
             key=private_key,
             chain_id=137,  # Polygon mainnet
         )
 
-        # create_or_derive: 如果已有则返回已有的，没有则创建新的
+        # create_or_derive: returns existing creds if available, otherwise creates new ones
         creds = temp_client.create_or_derive_api_creds()
 
         api_key = creds.api_key
         api_secret = creds.api_secret
         api_passphrase = creds.api_passphrase
 
-        print(f"\n✅ API Key:      {api_key[:12]}...")
-        print(f"✅ Secret:       {api_secret[:8]}...")
-        print(f"✅ Passphrase:   {api_passphrase[:8]}...")
+        print(f"\n  API Key:      {api_key[:12]}...")
+        print(f"  Secret:       {api_secret[:8]}...")
+        print(f"  Passphrase:   {api_passphrase[:8]}...")
 
-        # 写回 .env
+        # Write back to .env
         set_key(str(ENV_PATH), "POLYMARKET_API_KEY", api_key)
         set_key(str(ENV_PATH), "POLYMARKET_API_SECRET", api_secret)
         set_key(str(ENV_PATH), "POLYMARKET_API_PASSPHRASE", api_passphrase)
         # Lock down permissions after write (0600)
         os.chmod(ENV_PATH, 0o600)
 
-        print(f"\n✅ 凭证已写入 {ENV_PATH}")
+        print(f"\n  Credentials written to {ENV_PATH}")
 
-        # Step 2: 验证凭证有效
-        print("\n🔍 验证凭证...")
+        # Step 2: Verify credentials
+        print("\n  Verifying credentials...")
         client = ClobClient(
             host="https://clob.polymarket.com",
             key=private_key,
@@ -82,25 +82,25 @@ def main():
             funder=wallet_address,
         )
 
-        # 尝试获取 API key 列表来验证
+        # Verify by fetching API key list
         try:
             keys = client.get_api_keys()
-            print(f"✅ 验证成功！当前有 {len(keys) if keys else 0} 个活跃 API Key")
+            print(f"  Verified! {len(keys) if keys else 0} active API key(s)")
         except Exception:
-            print("⚠️ 凭证已生成但验证跳过（可能是首次创建）")
+            print("  Credentials generated but verification skipped (may be first-time creation)")
 
         print("\n" + "=" * 50)
-        print("🎉 设置完成！现在可以运行：")
+        print("  Setup complete! You can now run:")
         print("   python scripts/run_trader.py")
         print("=" * 50)
 
     except Exception as e:
-        print(f"\n❌ 生成失败: {e}")
-        print("\n排查步骤：")
-        print("  1. 检查私钥格式（以 0x 开头的 64 位 hex，或不带 0x）")
-        print("  2. 确认钱包里有少量 POL（用于 gas）")
-        print("  3. 确认钱包里有 USDC.e（用于交易）")
-        print("  4. 确认网络可以访问 clob.polymarket.com")
+        print(f"\n  Generation failed: {e}")
+        print("\nTroubleshooting:")
+        print("  1. Check private key format (64 hex chars, with or without 0x prefix)")
+        print("  2. Ensure wallet has some POL for gas")
+        print("  3. Ensure wallet has USDC.e for trading")
+        print("  4. Ensure network can reach clob.polymarket.com")
         sys.exit(1)
 
 

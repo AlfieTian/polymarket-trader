@@ -338,7 +338,7 @@ class CLOBExecutor:
             from py_clob_client.client import ClobClient
             from py_clob_client.clob_types import ApiCreds
 
-            # 用 create_or_derive 保证 L2 auth 可用（直接读 env 的 creds 有时会 401）
+            # Use create_or_derive to ensure L2 auth is available (env creds sometimes 401)
             _l1 = ClobClient(host=self.clob_url, key=self.private_key, chain_id=137)
             creds = _l1.create_or_derive_api_creds()
 
@@ -352,22 +352,22 @@ class CLOBExecutor:
             )
             logger.info("✅ CLOB client initialized (creds derived)")
 
-            # 启动时刷新 CLOB 的链上余额快照
+            # Sync on-chain balance snapshot on startup
             self._sync_clob_balance()
         except Exception as e:
             logger.error(f"Failed to init CLOB client: {e}")
 
     def _sync_clob_balance(self):
-        """通知 CLOB 刷新链上 token/USDC 余额，解决 'not enough balance/allowance' 问题"""
+        """Notify CLOB to refresh on-chain token/USDC balances, fixing 'not enough balance/allowance' errors."""
         try:
             from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
             from .position_manager import STATE_FILE
             import json
-            # 刷新 USDC
+            # Refresh USDC
             self._clob_client.update_balance_allowance(
                 params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=0)
             )
-            # 刷新持仓里的每个 conditional token
+            # Refresh each conditional token in positions
             try:
                 positions = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else []
             except Exception:

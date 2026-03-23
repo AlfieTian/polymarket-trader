@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-链上 ERC-20 approve：授权 Polymarket 合约花费 USDC.e
-只需运行一次
+On-chain ERC-20 approve: authorize Polymarket contracts to spend USDC.e
+Only needs to be run once.
 """
 import os, sys, json, time
 from pathlib import Path
@@ -20,7 +20,7 @@ RPC            = "https://polygon-bor-rpc.publicnode.com"
 # Polygon USDC.e
 USDC_E         = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
-# Polymarket 合约（CTF Exchange + Neg Risk CTF Exchange）
+# Polymarket contracts (CTF Exchange + Neg Risk CTF Exchange)
 SPENDERS = [
     ("CTF Exchange",          "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"),
     ("Neg Risk CTF Exchange", "0xC5d563A36AE78145C45a50134d48A1215220f80a"),
@@ -47,17 +47,17 @@ def encode_approve(spender: str, amount: int) -> bytes:
 
 def main():
     acct: LocalAccount = Account.from_key(PRIVATE_KEY)
-    print(f"钱包: {acct.address}\n")
+    print(f"Wallet: {acct.address}\n")
 
-    # 当前 nonce
+    # Current nonce
     nonce = int(rpc("eth_getTransactionCount", [WALLET, "pending"]), 16)
 
-    # 当前 gas price（加 20% 冗余）
+    # Current gas price (+20% buffer)
     gas_price = int(int(rpc("eth_gasPrice", []), 16) * 1.2)
     print(f"Gas Price: {gas_price / 1e9:.2f} Gwei\n")
 
     for name, spender in SPENDERS:
-        print(f"⚙️  Approve {name}...")
+        print(f"  Approve {name}...")
 
         tx = {
             "nonce":    nonce,
@@ -74,17 +74,17 @@ def main():
 
         try:
             tx_hash = rpc("eth_sendRawTransaction", [raw_hex])
-            print(f"  ✅ Tx 广播成功: {tx_hash}")
+            print(f"  Tx broadcast OK: {tx_hash}")
             print(f"     https://polygonscan.com/tx/{tx_hash}")
         except Exception as e:
-            print(f"  ❌ 失败: {e}")
+            print(f"  Failed: {e}")
 
         nonce += 1
         time.sleep(1)
 
-    print("\n⏳ 等待 tx 确认（约 5-10 秒）...")
+    print("\nWaiting for tx confirmation (~5-10s)...")
     time.sleep(10)
-    print("✅ 完成！现在机器人可以正常下单了。")
+    print("Done! The bot can now place orders.")
 
 
 if __name__ == "__main__":

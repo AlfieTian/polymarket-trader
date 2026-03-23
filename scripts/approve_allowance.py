@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-一键授权 Polymarket USDC Allowance
-必须在下单前运行一次
+One-click Polymarket USDC allowance approval.
+Must be run once before placing orders.
 """
 import os
 import sys
@@ -23,7 +23,7 @@ API_SECRET     = os.environ.get("POLYMARKET_API_SECRET", "").strip("'\"")
 API_PASSPHRASE = os.environ.get("POLYMARKET_API_PASSPHRASE", "").strip("'\"")
 
 def main():
-    print("🔑 连接 Polymarket CLOB...")
+    print("Connecting to Polymarket CLOB...")
     creds = ApiCreds(
         api_key=API_KEY,
         api_secret=API_SECRET,
@@ -38,43 +38,43 @@ def main():
         funder=WALLET_ADDRESS,
     )
 
-    print("\n📊 当前余额 & 授权状态：")
+    print("\nCurrent balance & allowance status:")
     try:
         bal = client.get_balance_allowance(
             params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
         print(f"  USDC Balance:   {bal}")
     except Exception as e:
-        print(f"  查询失败: {e}")
+        print(f"  Query failed: {e}")
 
-    print("\n⚙️  设置 USDC Allowance（COLLATERAL）...")
+    print("\nSetting USDC Allowance (COLLATERAL)...")
     try:
         result = client.update_balance_allowance(
             params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
-        print(f"  ✅ Allowance 设置成功: {result}")
+        print(f"  Allowance set successfully: {result}")
     except Exception as e:
-        print(f"  ❌ 失败: {e}")
+        print(f"  Failed: {e}")
 
-    print("\n⚙️  设置 Conditional Token Allowance...")
+    print("\nSetting Conditional Token Allowance...")
     try:
         result = client.update_balance_allowance(
             params=BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL)
         )
-        print(f"  ✅ Conditional Allowance 设置成功: {result}")
+        print(f"  Conditional Allowance set successfully: {result}")
     except Exception as e:
-        print(f"  ❌ 失败: {e}")
+        print(f"  Failed: {e}")
 
-    print("\n📊 授权后余额 & 状态：")
+    print("\nPost-approval balance & status:")
     try:
         bal = client.get_balance_allowance(
             params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
         print(f"  {bal}")
     except Exception as e:
-        print(f"  查询失败: {e}")
+        print(f"  Query failed: {e}")
 
-    print("\n🎉 完成！现在可以下单了。")
+    print("\nDone! You can now place orders.")
 
 if __name__ == "__main__":
     main()
