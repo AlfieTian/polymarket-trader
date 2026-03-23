@@ -62,7 +62,7 @@ $$C(\mathbf{q}) = b \cdot \ln\left(\sum_{i=1}^{n} e^{q_i/b}\right)$$
 $$\log P(H|\mathbf{D}) = \log P(H) + \sum_{k=1}^{t} \log P(D_k|H) - \log Z$$
 
 **Fractional Kelly:**
-$$f^* = \frac{\hat{p} - p}{1 - p} \times \text{kelly\_fraction}$$
+$$f^* = \frac{\hat{p} - p}{1 - p} \times \text{kelly}\_\text{fraction}$$
 
 ## Risk Disclaimer
 
