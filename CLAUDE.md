@@ -4,31 +4,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+This project uses **uv** for Python environment management (virtualenv in `.venv`). All commands should be run via `uv run`.
+
 ```bash
 # Install dependencies
-pip install -r requirements.txt
+uv sync
 
 # Run all tests
-pytest tests/ -v
+uv run pytest tests/ -v
 
 # Run a single test file
-pytest tests/test_bayesian_engine.py -v
+uv run pytest tests/test_bayesian_engine.py -v
 
 # Start the trader (reads config.yaml; dry_run=false means live orders)
-python scripts/run_trader.py
+uv run python scripts/run_trader.py
 
 # Run backtest
-python scripts/backtest.py
+uv run python scripts/backtest.py
 
 # Check LLM calibration
-python scripts/calibration_check.py
+uv run python scripts/calibration_check.py
 
 # One-time setup: approve USDC.e allowance on-chain (needed before live trading)
-python scripts/approve_allowance.py
-python scripts/onchain_approve.py
+uv run python scripts/approve_allowance.py
+uv run python scripts/onchain_approve.py
 
 # Manually redeem resolved positions
-python scripts/auto_redeem.py
+uv run python scripts/auto_redeem.py
 ```
 
 ## Credentials

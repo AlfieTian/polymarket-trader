@@ -561,6 +561,12 @@ class Trader:
             remote_positions = []
 
         phantoms_found = 0
+        # Track market_ids already added as phantoms this cycle.
+        # Prevents accumulation bug: parent markets with multiple CTF conditions
+        # (e.g. market_id="12" with 4 child tokens) would otherwise accumulate
+        # all child tokens into one giant position, vastly exceeding max_position_usdc.
+        phantom_market_ids_this_cycle: set[str] = set()
+
         for rp in remote_positions:
             token_id = rp.get("asset", "")
             if not token_id or token_id in tracked_tokens:
@@ -632,6 +638,29 @@ class Trader:
                 except Exception:
                     pass
 
+            # SAFETY: Skip if we already added a phantom for this market_id this cycle.
+            # Multi-outcome/parent markets can have many child tokens all sharing the same
+            # market_id; accumulating them would blow the max_position_usdc limit.
+            if market_id in phantom_market_ids_this_cycle:
+                logger.warning(
+                    f"⏭️  Skipping phantom {token_id[:16]}... — "
+                    f"market {market_id} already added this cycle (multi-token parent market guard)"
+                )
+                continue
+
+            # SAFETY: Cap phantom size_usdc to max_position_usdc for risk tracking.
+            # The actual on-chain size is still recorded in pos.size for correct exit sizing,
+            # but risk/Kelly exposure is capped to avoid portfolio overexposure from legacy tokens.
+            max_pos = self.config.get("strategy", {}).get("max_position_usdc", 5.0)
+            if size_usdc > max_pos:
+                logger.warning(
+                    f"⚠️  Phantom {market_id} size ${size_usdc:.2f} > max ${max_pos:.2f} — "
+                    f"capping tracked USDC to ${max_pos:.2f} (on-chain size={onchain_size:.2f} kept)"
+                )
+                tracked_size_usdc = max_pos
+            else:
+                tracked_size_usdc = size_usdc
+
             position = Position(
                 market_id=market_id,
                 condition_id=condition_id,
@@ -645,8 +674,9 @@ class Trader:
                 end_date=end_date,
             )
             self.positions.add_position(position)
-            self.risk.record_position(market_id, size_usdc)
-            self.kelly.record_position(market_id, size_usdc)
+            self.risk.record_position(market_id, tracked_size_usdc)
+            self.kelly.record_position(market_id, tracked_size_usdc)
+            phantom_market_ids_this_cycle.add(market_id)
             phantoms_found += 1
             state_changed = True
 
