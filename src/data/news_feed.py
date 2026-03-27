@@ -297,7 +297,12 @@ Respond in JSON format ONLY:
             elif self._anthropic_key:
                 return await self._call_anthropic(prompt, market.id, headlines)
         except Exception as e:
-            logger.warning(f"LLM call failed: {e}")
+            # Log response body for HTTP errors to aid diagnosis
+            resp_body = getattr(getattr(e, "response", None), "text", "")
+            if resp_body:
+                logger.warning(f"LLM call failed: {e} — response: {resp_body[:300]}")
+            else:
+                logger.warning(f"LLM call failed: {e}")
 
         return None
 

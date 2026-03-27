@@ -11,6 +11,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -239,9 +240,12 @@ class PolymarketClient:
                 market = self._parse_market(item)
                 if not market or market.volume_24h < min_volume:
                     continue
-                # FILTER: Skip resolved markets (no point trading them)
-                if market.status == MarketStatus.RESOLVED:
-                    logger.debug(f"🏁 Skipped resolved market: {market.question[:60]}")
+                # FILTER: Skip resolved or closed/expired markets
+                if market.status in (MarketStatus.RESOLVED, MarketStatus.CLOSED):
+                    logger.debug(
+                        f"🏁 Skipped {'resolved' if market.status == MarketStatus.RESOLVED else 'closed/expired'} "
+                        f"market: {market.question[:60]}"
+                    )
                     resolved_count += 1
                     continue
                 if is_banned_market(market.question, market.sports_market_type):
@@ -481,6 +485,27 @@ class PolymarketClient:
                 for tid, out in zip(token_ids, outcomes)
             ]
 
+            # Determine market status from API fields
+            is_resolved = bool(item.get("isResolved") or item.get("resolved"))
+            is_closed = bool(item.get("closed") or item.get("active") == False)
+            # Also check endDate: if end_date is in the past by >24h, treat as closed
+            end_date_str = item.get("endDate", "")
+            if not is_closed and end_date_str:
+                try:
+                    end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    now_utc = datetime.now(timezone.utc)
+                    if end_dt < now_utc:
+                        is_closed = True
+                except (ValueError, TypeError):
+                    pass
+
+            if is_resolved:
+                status = MarketStatus.RESOLVED
+            elif is_closed:
+                status = MarketStatus.CLOSED
+            else:
+                status = MarketStatus.ACTIVE
+
             return Market(
                 id=item.get("id", ""),
                 condition_id=item.get("conditionId", ""),
@@ -490,8 +515,8 @@ class PolymarketClient:
                 tokens=token_list,
                 volume_24h=float(item.get("volume24hr", 0)),
                 liquidity=float(item.get("liquidityClob", 0) or 0),
-                end_date=item.get("endDate", ""),
-                status=MarketStatus.ACTIVE,
+                end_date=end_date_str,
+                status=status,
                 category=item.get("category", ""),
                 description=item.get("description", ""),
                 sports_market_type=item.get("sportsMarketType", "") or "",

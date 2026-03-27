@@ -7,6 +7,7 @@ Supports dry-run mode for safe testing.
 
 import asyncio
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -466,7 +467,7 @@ class CLOBExecutor:
             meta = self.fetch_market_meta(condition_id) if condition_id else {"tick_size": "0.01", "neg_risk": False, "min_order_size": 5}
             snapped_price = self._snap_price(price, meta["tick_size"])
 
-            # Enforce market minimum order size
+            # Enforce market minimum order size (shares)
             min_size = meta.get("min_order_size", 5)
             if round(size, 2) < min_size:
                 min_cost = min_size * snapped_price
@@ -480,6 +481,30 @@ class CLOBExecutor:
                     order.status = OrderStatus.FAILED
                     return order
 
+            # Enforce Polymarket minimum order amount ($1 USDC for BUY orders)
+            # Even if shares >= min_size, cost = shares × price must be >= $1
+            MIN_ORDER_USDC = 1.0
+            if side == OrderSide.BUY:
+                order_cost = size * snapped_price
+                if order_cost < MIN_ORDER_USDC:
+                    # Bump shares up so cost hits $1
+                    size_needed = MIN_ORDER_USDC / snapped_price if snapped_price > 0 else size
+                    size_needed = math.ceil(size_needed * 100) / 100  # round up to 2dp
+                    bumped_cost = size_needed * snapped_price
+                    if bumped_cost <= self.max_position_usdc:
+                        logger.info(
+                            f"📐 Bumping {size:.2f}→{size_needed} shares "
+                            f"(min $1 USDC order, cost ${bumped_cost:.2f})"
+                        )
+                        size = size_needed
+                        order.size = size
+                    else:
+                        logger.warning(
+                            f"⏭️  Order skipped: min $1 cost ${bumped_cost:.2f} > cap ${self.max_position_usdc:.2f}"
+                        )
+                        order.status = OrderStatus.FAILED
+                        return order
+
             # Cancel any existing open orders for this token before placing new one
             # Prevents duplicate orders from piling up and freezing collateral
             self._cancel_existing_orders(token_id)
@@ -489,7 +514,6 @@ class CLOBExecutor:
                 order.status = OrderStatus.FAILED
                 return order
 
-            import math
             # For SELL orders: floor to 2dp to avoid exceeding CLOB balance
             # (on-chain balance may be e.g. 4.9999 shares, round() gives 5.0 > CLOB limit)
             # For BUY orders: round() is safe (we're spending USDC, not tokens)
