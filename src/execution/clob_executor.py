@@ -160,10 +160,24 @@ class CLOBExecutor:
         CTF_ABI = [{"inputs":[{"name":"account","type":"address"},{"name":"id","type":"uint256"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
         USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
         USDC_E_ABI = [{"inputs":[{"name":"account","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
-        RPC = "https://polygon-bor-rpc.publicnode.com"
-
-        self._w3 = Web3(Web3.HTTPProvider(RPC))
-        self._w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        # Primary RPC; fallback list in case of SSL/403 issues
+        RPC_LIST = [
+            "https://polygon-rpc.com",
+            "https://polygon-bor-rpc.publicnode.com",
+        ]
+        self._w3 = None
+        for rpc in RPC_LIST:
+            try:
+                candidate = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+                candidate.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                if candidate.is_connected():
+                    self._w3 = candidate
+                    logger.debug(f"Web3 connected via {rpc}")
+                    break
+            except Exception as e:
+                logger.debug(f"RPC {rpc} failed: {e}")
+        if self._w3 is None:
+            raise RuntimeError("All Polygon RPC endpoints unavailable")
         self._ctf_contract = self._w3.eth.contract(
             address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI
         )
@@ -171,7 +185,7 @@ class CLOBExecutor:
             address=Web3.to_checksum_address(USDC_E_ADDRESS), abi=USDC_E_ABI
         )
 
-    def _onchain_usdc_balance(self) -> float:
+    def _onchain_usdc_balance(self, fail_closed: bool = True) -> float | None:
         """Read USDC.e balance directly from Polygon chain (source of truth).
 
         Returns balance in USDC (raw / 1e6).
@@ -186,7 +200,7 @@ class CLOBExecutor:
             return balance
         except Exception as e:
             logger.warning(f"On-chain USDC.e balance check failed: {e}")
-            return 0.0  # fail closed for BUY safety
+            return 0.0 if fail_closed else None
 
     def _onchain_token_balance(self, token_id: str) -> float:
         """Check on-chain ERC-1155 conditional token balance via CTF contract.
@@ -226,9 +240,9 @@ class CLOBExecutor:
         if side == OrderSide.BUY:
             needed = size * price
             # Use on-chain USDC.e balance as source of truth
-            available = self._onchain_usdc_balance()
+            available = self._onchain_usdc_balance(fail_closed=True)
             if available + 1e-9 < needed:
-                logger.warning(
+                logger.info(
                     f"⏭️  Order skipped: on-chain USDC.e balance "
                     f"${available:.4f} < needed ${needed:.4f}"
                 )

@@ -26,7 +26,10 @@ logger = logging.getLogger("trader")
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-RPC = "https://polygon-bor-rpc.publicnode.com"
+RPC_LIST = [
+    "https://polygon-rpc.com",
+    "https://polygon-bor-rpc.publicnode.com",
+]
 
 CTF_ABI = json.loads("""[
   {"inputs":[{"name":"","type":"bytes32"},{"name":"","type":"uint256"}],"name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
@@ -48,25 +51,70 @@ class Redeemer:
     """Automatically redeem resolved positions to USDC.e."""
 
     def __init__(self, private_key: str, wallet_address: str):
-        self.w3 = Web3(Web3.HTTPProvider(RPC))
-        self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         self.private_key = private_key
-        self.wallet = Web3.to_checksum_address(wallet_address)
-        self.ctf = self.w3.eth.contract(
-            address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI
-        )
-        self.neg_risk_adapter = self.w3.eth.contract(
-            address=Web3.to_checksum_address(NEG_RISK_ADAPTER), abi=NEG_RISK_ABI
-        )
-        self.usdc = self.w3.eth.contract(
-            address=Web3.to_checksum_address(USDC_E), abi=USDC_ABI
-        )
+        self._wallet_address = wallet_address
+        # Lazy-init: actual Web3 connection deferred to first use so that
+        # temporary RPC outages don't prevent the trader from starting.
+        self._w3 = None
+        self._wallet = None
+        self._ctf = None
+        self._neg_risk_adapter = None
+        self._usdc = None
+
+    def _ensure_connected(self) -> bool:
+        """Establish Web3 connection on first use. Returns True if connected."""
+        if self._w3 is not None:
+            return True
+        for rpc in RPC_LIST:
+            try:
+                candidate = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+                candidate.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                if candidate.is_connected():
+                    self._w3 = candidate
+                    self._wallet = Web3.to_checksum_address(self._wallet_address)
+                    self._ctf = self._w3.eth.contract(
+                        address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI
+                    )
+                    self._neg_risk_adapter = self._w3.eth.contract(
+                        address=Web3.to_checksum_address(NEG_RISK_ADAPTER), abi=NEG_RISK_ABI
+                    )
+                    self._usdc = self._w3.eth.contract(
+                        address=Web3.to_checksum_address(USDC_E), abi=USDC_ABI
+                    )
+                    logger.debug(f"Redeemer Web3 connected via {rpc}")
+                    return True
+            except Exception as e:
+                logger.debug(f"Redeemer RPC {rpc} failed: {e}")
+        logger.warning("All Polygon RPC endpoints unavailable for Redeemer — will retry next cycle")
+        return False
+
+    @property
+    def w3(self):
+        return self._w3
+
+    @property
+    def wallet(self):
+        return self._wallet
+
+    @property
+    def ctf(self):
+        return self._ctf
+
+    @property
+    def neg_risk_adapter(self):
+        return self._neg_risk_adapter
+
+    @property
+    def usdc(self):
+        return self._usdc
 
     def is_resolved(self, condition_id: str) -> dict | None:
         """Check if a condition is resolved on-chain (CTF level).
-        
+
         Returns dict with payout info if resolved, None otherwise.
         """
+        if not self._ensure_connected():
+            return None
         try:
             cid_bytes = bytes.fromhex(condition_id.replace("0x", ""))
             denom = self.ctf.functions.payoutDenominator(cid_bytes).call()
@@ -85,6 +133,8 @@ class Redeemer:
 
     def is_neg_risk_determined(self, question_id: str) -> bool:
         """Check if a neg_risk market's questionID is determined on NegRiskAdapter."""
+        if not self._ensure_connected():
+            return False
         try:
             qid_bytes = bytes.fromhex(question_id.replace("0x", ""))
             return self.neg_risk_adapter.functions.getDetermined(qid_bytes).call()
@@ -250,6 +300,8 @@ class Redeemer:
         If the initial method reverts, retries once with the alternate method
         (standard CTF vs NegRiskAdapter) using a fresh nonce to avoid conflicts.
         """
+        if not self._ensure_connected():
+            return 0.0
         bal_before = self.usdc.functions.balanceOf(self.wallet).call()
         cid_bytes = bytes.fromhex(condition_id.replace("0x", ""))
 
