@@ -113,6 +113,7 @@ class PositionManager:
         min_edge_to_hold: float = 0.02,
         exit_max_retries: int = 5,
         exit_price_step: float = 0.01,
+        near_ceiling_price: float = 0.98,
     ):
         self.profit_target_pct = profit_target_pct
         self.stop_loss_pct = stop_loss_pct
@@ -120,6 +121,7 @@ class PositionManager:
         self.min_edge_to_hold = min_edge_to_hold
         self.exit_max_retries = exit_max_retries
         self.exit_price_step = exit_price_step
+        self.near_ceiling_price = near_ceiling_price
         self._positions: dict[str, Position] = {}
         self._load_state()
 
@@ -270,7 +272,24 @@ class PositionManager:
                     ),
                 )
 
-            # 2. Profit target
+            # 2. Near-ceiling: price so close to 1.0 that waiting for
+            #    settlement isn't worth the time cost
+            elif (
+                effective_price >= self.near_ceiling_price
+                and pos.unrealized_pnl_pct > 0
+            ):
+                exit_signal = ExitSignal(
+                    position=pos,
+                    reason=ExitReason.PROFIT_TARGET,
+                    current_price=effective_price,
+                    message=(
+                        f"Near-ceiling take-profit: price {effective_price:.2f} "
+                        f">= {self.near_ceiling_price:.2f}, "
+                        f"PnL +{pos.unrealized_pnl_pct:.1%}"
+                    ),
+                )
+
+            # 3. Profit target (percentage-based)
             elif pos.unrealized_pnl_pct >= self.profit_target_pct:
                 exit_signal = ExitSignal(
                     position=pos,
@@ -282,7 +301,7 @@ class PositionManager:
                     ),
                 )
 
-            # 3. Edge reversal (our model no longer agrees with this position)
+            # 4. Edge reversal (our model no longer agrees with this position)
             elif not skip_edge_reversal and p_hat is not None:
                 if pos.side == "YES":
                     current_edge = p_hat - effective_price

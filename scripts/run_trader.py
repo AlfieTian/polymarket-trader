@@ -121,6 +121,7 @@ class Trader:
             min_edge_to_hold=pos_cfg.get("min_edge_to_hold", 0.02),
             exit_max_retries=pos_cfg.get("exit_max_retries", 5),
             exit_price_step=pos_cfg.get("exit_price_step", 0.01),
+            near_ceiling_price=pos_cfg.get("near_ceiling_price", 0.98),
         )
 
         self.redeemer = Redeemer(
@@ -243,6 +244,18 @@ class Trader:
     def _save_pending_orders(self) -> None:
         self._pending_orders_file.parent.mkdir(parents=True, exist_ok=True)
         self._pending_orders_file.write_text(json.dumps(self._pending_orders, indent=2))
+
+    @staticmethod
+    def _normalize_entry_order(size_usdc: float, entry_price: float, min_shares: float = 5.0) -> tuple[float, float]:
+        """Return the actual order size/cost after minimum-order normalization."""
+        if entry_price <= 0:
+            return 0.0, 0.0
+
+        shares = size_usdc / entry_price if size_usdc > 0 else 0.0
+        if 0 < shares < min_shares:
+            shares = float(min_shares)
+        order_cost = shares * entry_price if shares > 0 else 0.0
+        return shares, order_cost
 
     def _add_pending_order(self, order_id: str, opp, market, token_id: str, entry_price: float, shares: float) -> None:
         self._pending_orders.append({
@@ -989,33 +1002,52 @@ class Trader:
                 if pos_size.position_usdc <= 0:
                     continue
 
-                # Guard: Polymarket minimum order is 5 shares. Estimate minimum cost
-                # and skip if we don't have enough remaining portfolio capacity to cover it —
-                # this prevents the CLOBExecutor min-order bump from firing a guaranteed
-                # "not enough balance" error against the API.
-                # NOTE: opp.market_price is already the correct entry-side price:
-                #   YES → market_price_yes,  NO → 1 - market_price_yes
-                # Do NOT invert again for NO — that would re-introduce a double-conversion bug.
-                MIN_POLYMARKET_SHARES = 5
                 entry_price_est = opp.market_price  # EdgeDetector already normalised to entry side
-                est_min_order_usdc = MIN_POLYMARKET_SHARES * max(entry_price_est, 0.01)
+                if entry_price_est >= self.positions.near_ceiling_price:
+                    logger.info(
+                        f"⏭️  {opp.market_id} {opp.side} skipped: entry price "
+                        f"{entry_price_est:.2f} >= near-ceiling {self.positions.near_ceiling_price:.2f} "
+                        f"(upside too small to justify entry)"
+                    )
+                    continue
+
+                normalized_shares, normalized_cost = self._normalize_entry_order(
+                    pos_size.position_usdc, entry_price_est
+                )
+                if normalized_shares <= 0:
+                    continue
+
                 remaining = self.kelly.remaining_capacity
-                if est_min_order_usdc > remaining:
+                if normalized_cost > remaining:
                     logger.info(
                         f"⏭️  Skipping {opp.market_id} {opp.side}: "
-                        f"min order ~${est_min_order_usdc:.2f} > remaining capacity "
+                        f"actual entry cost ${normalized_cost:.2f} > remaining capacity "
                         f"${remaining:.2f}"
                     )
                     continue
 
                 # Risk check
-                risk_check = self.risk.validate_trade(opp.market_id, pos_size.position_usdc)
+                risk_check = self.risk.validate_trade(opp.market_id, normalized_cost)
                 if not risk_check.approved:
                     logger.warning(f"❌ Risk rejected {opp.market_id}: {risk_check.reason}")
                     continue
 
+                if not self.dry_run:
+                    onchain_balance = self.executor._onchain_usdc_balance(fail_closed=False)
+                    if onchain_balance is None:
+                        logger.warning(
+                            f"⚠️  On-chain balance pre-check unavailable for {opp.market_id} "
+                            f"(continuing to executor checks)"
+                        )
+                    elif onchain_balance < normalized_cost:
+                        logger.info(
+                            f"⏭️  {opp.market_id} skipped: on-chain balance ${onchain_balance:.2f} "
+                            f"< order cost ${normalized_cost:.2f}"
+                        )
+                        continue
+
                 # Execute entry
-                await self._execute_entry(opp, pos_size.position_usdc, market_map)
+                await self._execute_entry(opp, normalized_cost, market_map)
 
         # ─── 5. Portfolio summary ──────────────────────────────
         summary = self.positions.summary()
@@ -1054,7 +1086,7 @@ class Trader:
             token_id = market.no_token_id
             entry_price = 1.0 - market.yes_price
 
-        shares = size_usdc / entry_price if entry_price > 0 else 0
+        shares, _ = self._normalize_entry_order(size_usdc, entry_price)
         if shares <= 0:
             return
 
@@ -1062,7 +1094,7 @@ class Trader:
         if not self.executor.has_sufficient_balance(
             side=OrderSide.BUY, price=entry_price, size=shares, token_id=token_id
         ):
-            logger.warning(
+            logger.info(
                 f"⏭️  Entry skipped for {opp.market_id}: insufficient USDC.e balance/allowance"
             )
             return

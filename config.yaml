@@ -23,6 +23,7 @@ lmsr:
 
 position:
   profit_target_pct: 0.18    # Take profit when price moves 18% in favorable direction (reduces churn)
+  near_ceiling_price: 0.98   # Take profit when effective price >= this (remaining upside too small to justify waiting)
   stop_loss_pct: 0.25        # Stop loss at 25% (leave room for event market volatility)
   pre_resolution_hours: 2.0  # Force close 2 hours before resolution
   min_edge_to_hold: 0.02     # Close when edge drops below 2% (model no longer supports the position)

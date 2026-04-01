@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -226,3 +227,111 @@ def test_execute_exit_records_actual_fill_price_in_trade_history():
     assert trader.kelly.closed == ["m1"]
     assert trader.perf.closed[0].exit_price == 0.72
     assert trader.perf.closed[0].size_usdc == 5.0
+
+
+def test_run_cycle_uses_normalized_entry_cost_for_risk_and_skips_balance_probe_in_dry_run():
+    trader = Trader.__new__(Trader)
+    trader.dry_run = True
+    trader._cycle_count = 0
+    trader._redeem_interval_cycles = 99
+    trader._reconcile_interval_cycles = 99
+    trader._pending_orders = []
+    trader._check_pending_orders = lambda: None
+    trader._in_cooldown = lambda market_id: False
+    trader._in_exit_cooldown = lambda market_id: False
+    trader._ensure_position_prices = lambda *args, **kwargs: asyncio.sleep(0)
+    trader._check_redemptions = lambda: asyncio.sleep(0)
+    trader._periodic_onchain_reconcile = lambda: asyncio.sleep(0)
+
+    market = SimpleNamespace(
+        id="m1",
+        question="Example?",
+        yes_price=0.90,
+        volume_24h=10000,
+        end_date="",
+        condition_id="c1",
+        yes_token_id="yes-1",
+        no_token_id="no-1",
+    )
+    opp = SimpleNamespace(
+        market_id="m1",
+        side="YES",
+        market_price=0.90,
+        p_hat=0.98,
+        edge=0.03,
+    )
+    belief = SimpleNamespace(p_hat=0.98, update_history=[{"confidence": 1.0}])
+    risk_calls = []
+    execute_calls = []
+
+    class _CyclePositions:
+        open_positions = []
+        near_ceiling_price = 0.98
+
+        def get_position(self, market_id: str):
+            return None
+
+        def check_exits(self, *_args, **_kwargs):
+            return []
+
+        def summary(self):
+            return {"open_positions": 0, "total_exposure_usdc": 0.0}
+
+    class _CycleBayesian:
+        def get_belief(self, market_id: str):
+            return belief
+
+        def init_belief(self, market_id: str, yes_price: float):
+            return None
+
+        def is_tradeable(self, market_id: str):
+            return True
+
+        def batch_update(self, market_id: str, signals):
+            return None
+
+    class _CycleKelly:
+        remaining_capacity = 10.0
+
+        def calculate(self, **_kwargs):
+            return SimpleNamespace(position_usdc=2.0)
+
+    class _CycleRisk:
+        def validate_trade(self, market_id: str, size_usdc: float):
+            risk_calls.append((market_id, size_usdc))
+            return SimpleNamespace(approved=True, reason="")
+
+    class _CycleExecutor:
+        def _onchain_usdc_balance(self, fail_closed=True):
+            raise AssertionError("dry_run should not probe on-chain USDC balance")
+
+    class _CycleClient:
+        async def get_markets(self, limit=100, min_volume=1000):
+            return [market]
+
+    class _CycleNewsFeed:
+        async def get_llm_signals(self, market):
+            return []
+
+    class _CycleEdgeDetector:
+        def scan_markets(self, scan_data):
+            return [opp]
+
+    async def _fake_execute_entry(opportunity, size_usdc: float, market_map: dict):
+        execute_calls.append((opportunity.market_id, size_usdc, market_map[opportunity.market_id].condition_id))
+
+    trader.client = _CycleClient()
+    trader.positions = _CyclePositions()
+    trader.bayesian = _CycleBayesian()
+    trader.news_feed = _CycleNewsFeed()
+    trader.edge_detector = _CycleEdgeDetector()
+    trader.kelly = _CycleKelly()
+    trader.risk = _CycleRisk()
+    trader.executor = _CycleExecutor()
+    trader._min_llm_confidence = 0.5
+    trader._execute_entry = _fake_execute_entry
+
+    asyncio.run(trader.run_cycle())
+
+    assert risk_calls == [("m1", pytest.approx(4.5))]
+    assert execute_calls == [("m1", pytest.approx(4.5), "c1")]
