@@ -336,8 +336,9 @@ Respond in JSON format ONLY:
             },
             json={
                 # o4-mini: 10M tokens/day free, strong reasoning for probability estimation
+                # NOTE: reasoning models consume internal tokens before output; use 2048 to avoid truncation
                 "model": "o4-mini",
-                "max_completion_tokens": 512,
+                "max_completion_tokens": 2048,
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
