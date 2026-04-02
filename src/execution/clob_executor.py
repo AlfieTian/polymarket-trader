@@ -149,8 +149,24 @@ class CLOBExecutor:
             logger.warning(f"Balance/allowance fetch failed: {e}")
             return {"balance": 0.0, "allowance": 0.0}
 
+    def _reset_web3(self):
+        """Reset Web3 connection (call after SSL/connection errors)."""
+        self._w3 = None
+        self._w3_checked_at = 0.0
+
     def _ensure_web3(self):
         """Lazily initialize Web3 + contract instances for on-chain reads."""
+        if hasattr(self, "_w3") and self._w3 is not None:
+            # Verify connection is still alive at most once per 60s
+            now = time.time()
+            last_check = getattr(self, "_w3_checked_at", 0.0)
+            if now - last_check > 60:
+                try:
+                    self._w3.eth.block_number  # lightweight liveness check
+                    self._w3_checked_at = now
+                except Exception:
+                    logger.debug("Web3 connection lost, reconnecting...")
+                    self._w3 = None
         if hasattr(self, "_w3") and self._w3 is not None:
             return
         from web3 import Web3
@@ -200,6 +216,7 @@ class CLOBExecutor:
             return balance
         except Exception as e:
             logger.warning(f"On-chain USDC.e balance check failed: {e}")
+            self._reset_web3()  # Force reconnect next call
             return 0.0 if fail_closed else None
 
     def _onchain_token_balance(self, token_id: str) -> float:
@@ -220,6 +237,7 @@ class CLOBExecutor:
             return shares
         except Exception as e:
             logger.warning(f"On-chain token balance check failed for {token_id[:12]}...: {e}")
+            self._reset_web3()  # Force reconnect next call
             return float("inf")  # fail open so the CLOB handles rejection
 
     def has_sufficient_balance(

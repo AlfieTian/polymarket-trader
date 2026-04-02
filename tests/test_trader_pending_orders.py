@@ -116,6 +116,16 @@ class _DummyExitPositions:
         self.closed.append(market_id)
 
 
+class _DummyReconcilePositions(_DummyExitPositions):
+    def __init__(self, open_positions):
+        super().__init__()
+        self.open_positions = list(open_positions)
+
+    def close_position(self, market_id: str):
+        super().close_position(market_id)
+        self.open_positions = [p for p in self.open_positions if p.market_id != market_id]
+
+
 class _DummyPerf:
     def __init__(self):
         self.closed = []
@@ -158,6 +168,14 @@ class _DummyExitExecutor:
 
     def _sync_clob_balance(self):
         self.synced += 1
+
+
+class _DummyReconcileExecutor:
+    def __init__(self, onchain_balance=0.0):
+        self.onchain_balance = onchain_balance
+
+    def _onchain_token_balance(self, token_id: str):
+        return self.onchain_balance
 
 
 def test_execute_exit_partial_fill_updates_remaining_exposure():
@@ -227,6 +245,45 @@ def test_execute_exit_records_actual_fill_price_in_trade_history():
     assert trader.kelly.closed == ["m1"]
     assert trader.perf.closed[0].exit_price == 0.72
     assert trader.perf.closed[0].size_usdc == 5.0
+
+
+def test_periodic_reconcile_sweep_does_not_record_synthetic_realized_pnl():
+    trader = Trader.__new__(Trader)
+    pos = Position(
+        market_id="m1",
+        condition_id="",
+        token_id="t1",
+        side="YES",
+        entry_price=0.50,
+        size=10.0,
+        size_usdc=5.0,
+        p_hat_at_entry=0.55,
+        market_price_at_entry=0.50,
+    )
+    pos._current_price = 0.80
+
+    trader.dry_run = False
+    trader._wallet_address = "0xabc"
+    trader.positions = _DummyReconcilePositions([pos])
+    trader.risk = _DummyExposure()
+    trader.kelly = _DummyExposure()
+    trader.perf = _DummyPerf()
+    trader.executor = _DummyReconcileExecutor(onchain_balance=0.0)
+    trader.redeemer = SimpleNamespace(is_resolved=lambda condition_id: None)
+    trader.client = SimpleNamespace(get_wallet_positions=lambda wallet: [])
+    trader._pending_orders = []
+    trader._recently_confirmed_tokens = set()
+    trader._add_exit_cooldown = lambda market_id: None
+    trader._in_exit_cooldown = lambda market_id: False
+    trader._resync_portfolio_trackers = lambda: None
+
+    asyncio.run(trader._periodic_onchain_reconcile())
+
+    assert trader.positions.closed == ["m1"]
+    assert trader.risk.closed == ["m1"]
+    assert trader.kelly.closed == ["m1"]
+    assert trader.risk.pnl == []
+    assert trader.perf.closed == []
 
 
 def test_run_cycle_uses_normalized_entry_cost_for_risk_and_skips_balance_probe_in_dry_run():

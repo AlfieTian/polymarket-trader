@@ -96,7 +96,11 @@ class NewsFeed:
 
     async def _get_http(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
-            self._http = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+            # keepalive_expiry=20s: avoids SSL EOF when server closes idle connections
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0),
+                limits=httpx.Limits(keepalive_expiry=20, max_keepalive_connections=5),
+            )
         return self._http
 
     # ─── LLM Signal Generation ────────────────────────────────

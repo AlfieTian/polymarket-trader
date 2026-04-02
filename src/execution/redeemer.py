@@ -13,6 +13,7 @@ For neg_risk (multi-outcome) markets:
 """
 
 import json
+import time
 import logging
 import os
 import urllib.request
@@ -56,6 +57,7 @@ class Redeemer:
         # Lazy-init: actual Web3 connection deferred to first use so that
         # temporary RPC outages don't prevent the trader from starting.
         self._w3 = None
+        self._w3_checked_at = 0.0
         self._wallet = None
         self._ctf = None
         self._neg_risk_adapter = None
@@ -63,6 +65,17 @@ class Redeemer:
 
     def _ensure_connected(self) -> bool:
         """Establish Web3 connection on first use. Returns True if connected."""
+        if self._w3 is not None:
+            # Verify connection is still alive at most once per 60s
+            now = time.time()
+            last_check = getattr(self, "_w3_checked_at", 0.0)
+            if now - last_check > 60:
+                try:
+                    self._w3.eth.block_number
+                    self._w3_checked_at = now
+                except Exception:
+                    logger.debug("Redeemer Web3 connection lost, reconnecting...")
+                    self._w3 = None
         if self._w3 is not None:
             return True
         for rpc in RPC_LIST:

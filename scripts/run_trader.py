@@ -507,11 +507,24 @@ class Trader:
                     )
                     if not won:
                         # Losing position — tokens are worthless, just remove
+                        pnl_loss = -pos.size_usdc
                         self.positions.close_position(pos.market_id)
                         self.risk.close_position(pos.market_id)
                         self.kelly.close_position(pos.market_id)
-                        self.risk.record_pnl(-pos.size_usdc)
+                        self.risk.record_pnl(pnl_loss)
                         self._add_exit_cooldown(pos.market_id)
+                        # ── Record to trade history ──────────────────────
+                        _trade = ClosedTrade(
+                            market_id=pos.market_id,
+                            side=pos.side,
+                            entry_price=pos.entry_price,
+                            exit_price=0.0,
+                            size_usdc=pos.size_usdc,
+                            realized_pnl=round(pnl_loss, 4),
+                            realized_pnl_pct=-1.0,
+                            exit_reason="resolution_reconcile",
+                        )
+                        self.perf.record_close(_trade)
                         removed += 1
                         state_changed = True
                         continue
@@ -527,6 +540,8 @@ class Trader:
                     f"🧹 On-chain reconcile: removing {pos.market_id} — "
                     f"no on-chain balance for token {pos.token_id[:16]}..."
                 )
+                # Absence on-chain only tells us the position is gone, not how it exited.
+                # Do not fabricate realized PnL or a synthetic close price here.
                 self.positions.close_position(pos.market_id)
                 self.risk.close_position(pos.market_id)
                 self.kelly.close_position(pos.market_id)
