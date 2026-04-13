@@ -187,6 +187,7 @@ def test_execute_exit_partial_fill_updates_remaining_exposure():
     trader.executor = _DummyExitExecutor(
         OrderStatus.PARTIALLY_FILLED, filled_size=4.0, filled_avg_price=0.72
     )
+    trader.redeemer = SimpleNamespace(is_resolved=lambda condition_id: None)
     trader._add_exit_cooldown = lambda market_id: None
     trader._strat_cfg = {}
     trader.edge_detector = object()
@@ -222,6 +223,7 @@ def test_execute_exit_records_actual_fill_price_in_trade_history():
     trader.executor = _DummyExitExecutor(
         OrderStatus.FILLED, filled_size=10.0, filled_avg_price=0.72
     )
+    trader.redeemer = SimpleNamespace(is_resolved=lambda condition_id: None)
     trader._add_exit_cooldown = lambda market_id: None
     trader._strat_cfg = {}
     trader.edge_detector = object()
@@ -284,6 +286,42 @@ def test_periodic_reconcile_sweep_does_not_record_synthetic_realized_pnl():
     assert trader.kelly.closed == ["m1"]
     assert trader.risk.pnl == []
     assert trader.perf.closed == []
+
+
+def test_check_redemptions_already_redeemed_uses_partial_payout_ratio():
+    trader = Trader.__new__(Trader)
+    pos = Position(
+        market_id="m1",
+        condition_id="c1",
+        token_id="t1",
+        side="YES",
+        entry_price=0.50,
+        size=10.0,
+        size_usdc=5.0,
+        p_hat_at_entry=0.55,
+        market_price_at_entry=0.50,
+    )
+
+    trader.positions = _DummyReconcilePositions([pos])
+    trader.risk = _DummyExposure()
+    trader.kelly = _DummyExposure()
+    trader.perf = _DummyPerf()
+    trader.redeemer = SimpleNamespace(
+        is_resolved=lambda condition_id: {"denominator": 2, "payout_yes": 1, "payout_no": 1},
+        _lookup_neg_risk_info=lambda condition_id, token_id: None,
+        redeem=lambda condition_id, neg_risk, token_id: 0.0,
+        get_token_balance=lambda token_id: 0,
+    )
+    trader._add_exit_cooldown = lambda market_id: None
+
+    asyncio.run(trader._check_redemptions())
+
+    assert trader.positions.closed == ["m1"]
+    assert trader.risk.closed == ["m1"]
+    assert trader.kelly.closed == ["m1"]
+    assert trader.risk.pnl == [pytest.approx(0.0)]
+    assert trader.perf.closed[0].realized_pnl == pytest.approx(0.0)
+    assert trader.perf.closed[0].exit_price == pytest.approx(0.5)
 
 
 def test_run_cycle_uses_normalized_entry_cost_for_risk_and_skips_balance_probe_in_dry_run():

@@ -1187,6 +1187,16 @@ class Trader:
         """
         from src.execution.clob_executor import OrderStatus
 
+        # Skip CLOB sell for already-resolved markets — the redeemer handles those.
+        if pos.condition_id:
+            resolution = await asyncio.to_thread(self.redeemer.is_resolved, pos.condition_id)
+            if resolution is not None:
+                logger.info(
+                    f"⏭️  Skipping CLOB exit for {pos.market_id} — "
+                    f"market already resolved on-chain, deferring to redeemer"
+                )
+                return
+
         max_retries = self.positions.exit_max_retries
         price_step  = self.positions.exit_price_step
 
@@ -1430,6 +1440,8 @@ class Trader:
             else:
                 payout = resolution["payout_no"]
 
+            denominator = resolution.get("denominator", 1) or 1
+            payout_ratio = payout / denominator
             won = payout > 0
             logger.info(
                 f"🏁 Market {pos.market_id} RESOLVED on-chain — "
@@ -1450,14 +1462,29 @@ class Trader:
                 pos.token_id,
             )
 
-            # Bug fix: if we WON but redeem returned 0 (tx failure / already redeemed),
-            # do NOT record -100% loss — instead treat as pending redemption and skip close.
+            # If we WON but redeem returned $0, check on-chain balance.
+            # If no tokens remain, they were already redeemed — close cleanly.
             if won and redeemed == 0:
-                logger.warning(
-                    f"⚠️  {pos.market_id} WON but redeem returned $0 — "
-                    f"skipping close, will retry next cycle"
+                on_chain_bal = await asyncio.to_thread(
+                    self.redeemer.get_token_balance, pos.token_id
                 )
-                continue
+                if on_chain_bal is None:
+                    logger.warning(
+                        f"⚠️  {pos.market_id} WON but redeem returned $0 and "
+                        f"balance probe failed — will retry next cycle"
+                    )
+                    continue
+                if on_chain_bal > 0:
+                    logger.warning(
+                        f"⚠️  {pos.market_id} WON but redeem returned $0 "
+                        f"(balance={on_chain_bal / 1e6:.6f}) — will retry next cycle"
+                    )
+                    continue
+                logger.info(
+                    f"✅ {pos.market_id} WON — on-chain balance is 0, "
+                    f"tokens already redeemed. Closing position."
+                )
+                redeemed = pos.size * payout_ratio
 
             # Close position in tracker
             closed_size_usdc = pos.size_usdc
@@ -1469,7 +1496,7 @@ class Trader:
             self._add_exit_cooldown(pos.market_id)
 
             from src.strategy.performance_tracker import ClosedTrade
-            exit_price = 1.0 if won else 0.0
+            exit_price = payout_ratio if won else 0.0
             trade = ClosedTrade(
                 market_id=pos.market_id,
                 side=pos.side,
