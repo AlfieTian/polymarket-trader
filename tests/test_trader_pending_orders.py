@@ -288,6 +288,90 @@ def test_periodic_reconcile_sweep_does_not_record_synthetic_realized_pnl():
     assert trader.perf.closed == []
 
 
+def test_periodic_reconcile_keeps_resolved_winner_when_balance_probe_fails():
+    trader = Trader.__new__(Trader)
+    pos = Position(
+        market_id="m1",
+        condition_id="c1",
+        token_id="t1",
+        side="YES",
+        entry_price=0.50,
+        size=10.0,
+        size_usdc=5.0,
+        p_hat_at_entry=0.55,
+        market_price_at_entry=0.50,
+    )
+
+    trader.dry_run = False
+    trader._wallet_address = "0xabc"
+    trader.positions = _DummyReconcilePositions([pos])
+    trader.risk = _DummyExposure()
+    trader.kelly = _DummyExposure()
+    trader.perf = _DummyPerf()
+    trader.executor = _DummyReconcileExecutor(onchain_balance=0.0)
+    trader.redeemer = SimpleNamespace(
+        is_resolved=lambda condition_id: {"payout_yes": 1, "payout_no": 0},
+        get_token_balance=lambda token_id: None,
+    )
+    trader.client = SimpleNamespace(get_wallet_positions=lambda wallet: [])
+    trader._pending_orders = []
+    trader._recently_confirmed_tokens = set()
+    trader._add_exit_cooldown = lambda market_id: None
+    trader._in_exit_cooldown = lambda market_id: False
+    trader._resync_portfolio_trackers = lambda: None
+
+    asyncio.run(trader._periodic_onchain_reconcile())
+
+    assert trader.positions.closed == []
+    assert [p.market_id for p in trader.positions.open_positions] == ["m1"]
+    assert trader.risk.closed == []
+    assert trader.kelly.closed == []
+    assert trader.risk.pnl == []
+    assert trader.perf.closed == []
+
+
+def test_periodic_reconcile_already_redeemed_uses_partial_payout_ratio():
+    trader = Trader.__new__(Trader)
+    pos = Position(
+        market_id="m1",
+        condition_id="c1",
+        token_id="t1",
+        side="YES",
+        entry_price=0.50,
+        size=10.0,
+        size_usdc=5.0,
+        p_hat_at_entry=0.55,
+        market_price_at_entry=0.50,
+    )
+
+    trader.dry_run = False
+    trader._wallet_address = "0xabc"
+    trader.positions = _DummyReconcilePositions([pos])
+    trader.risk = _DummyExposure()
+    trader.kelly = _DummyExposure()
+    trader.perf = _DummyPerf()
+    trader.executor = _DummyReconcileExecutor(onchain_balance=0.0)
+    trader.redeemer = SimpleNamespace(
+        is_resolved=lambda condition_id: {"denominator": 2, "payout_yes": 1, "payout_no": 1},
+        get_token_balance=lambda token_id: 0,
+    )
+    trader.client = SimpleNamespace(get_wallet_positions=lambda wallet: [])
+    trader._pending_orders = []
+    trader._recently_confirmed_tokens = set()
+    trader._add_exit_cooldown = lambda market_id: None
+    trader._in_exit_cooldown = lambda market_id: False
+    trader._resync_portfolio_trackers = lambda: None
+
+    asyncio.run(trader._periodic_onchain_reconcile())
+
+    assert trader.positions.closed == ["m1"]
+    assert trader.risk.closed == ["m1"]
+    assert trader.kelly.closed == ["m1"]
+    assert trader.risk.pnl == [pytest.approx(0.0)]
+    assert trader.perf.closed[0].realized_pnl == pytest.approx(0.0)
+    assert trader.perf.closed[0].exit_price == pytest.approx(0.5)
+
+
 def test_check_redemptions_already_redeemed_uses_partial_payout_ratio():
     trader = Trader.__new__(Trader)
     pos = Position(

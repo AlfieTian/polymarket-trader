@@ -500,7 +500,10 @@ class Trader:
             if pos.condition_id:
                 resolution = self.redeemer.is_resolved(pos.condition_id)
                 if resolution is not None:
-                    won = (resolution["payout_yes"] > 0) if pos.side == "YES" else (resolution["payout_no"] > 0)
+                    payout = resolution["payout_yes"] if pos.side == "YES" else resolution["payout_no"]
+                    denominator = resolution.get("denominator", 1) or 1
+                    payout_ratio = payout / denominator
+                    won = payout > 0
                     logger.warning(
                         f"🏁 On-chain reconcile: {pos.market_id} RESOLVED — "
                         f"{pos.side} {'WON' if won else 'LOST'}"
@@ -528,7 +531,42 @@ class Trader:
                         removed += 1
                         state_changed = True
                         continue
-                    # Won — leave for the existing _check_redemptions to handle
+                    # Won — check if tokens are already redeemed (balance=0).
+                    # If so, close the position rather than deferring forever.
+                    on_chain_bal = self.redeemer.get_token_balance(pos.token_id)
+                    if on_chain_bal is None:
+                        logger.warning(
+                            f"⚠️  On-chain reconcile: balance probe failed for "
+                            f"{pos.market_id}, keeping position until a later retry"
+                        )
+                        continue
+                    if on_chain_bal < 1:  # < 1 raw unit ≈ 0 after 1e6 decimals
+                        logger.info(
+                            f"✅ On-chain reconcile: {pos.market_id} WON, "
+                            f"balance=0 — already redeemed, closing position"
+                        )
+                        redeemed_value = pos.size * payout_ratio
+                        pnl_win = redeemed_value - pos.size_usdc
+                        self.risk.record_pnl(pnl_win)
+                        self.positions.close_position(pos.market_id)
+                        self.risk.close_position(pos.market_id)
+                        self.kelly.close_position(pos.market_id)
+                        self._add_exit_cooldown(pos.market_id)
+                        _trade = ClosedTrade(
+                            market_id=pos.market_id,
+                            side=pos.side,
+                            entry_price=pos.entry_price,
+                            exit_price=payout_ratio,
+                            size_usdc=pos.size_usdc,
+                            realized_pnl=round(pnl_win, 4),
+                            realized_pnl_pct=round(pnl_win / pos.size_usdc, 4) if pos.size_usdc else 0,
+                            exit_reason="resolution_reconcile",
+                        )
+                        self.perf.record_close(_trade)
+                        removed += 1
+                        state_changed = True
+                        continue
+                    # Won with tokens still on-chain — leave for _check_redemptions
                     continue
 
             actual_balance = self.executor._onchain_token_balance(pos.token_id)
@@ -804,14 +842,34 @@ class Trader:
                 try:
                     resolution = self.redeemer.is_resolved(pos.condition_id)
                     if resolution is not None:
-                        won = (resolution["payout_yes"] > 0) if pos.side == "YES" else (resolution["payout_no"] > 0)
+                        payout = resolution["payout_yes"] if pos.side == "YES" else resolution["payout_no"]
+                        denominator = resolution.get("denominator", 1) or 1
+                        payout_ratio = payout / denominator
+                        won = payout > 0
                         logger.warning(
                             f"🏁 Startup: {pos.market_id} RESOLVED — "
                             f"{pos.side} {'WON' if won else 'LOST'}, removing from local state"
                         )
-                        if not won:
-                            self.risk.record_pnl(-pos.size_usdc)
+                        if won:
+                            # Check on-chain balance: if tokens remain, leave
+                            # for _check_redemptions instead of orphaning them.
+                            on_chain_bal = self.redeemer.get_token_balance(pos.token_id)
+                            if on_chain_bal is None or on_chain_bal > 0:
+                                logger.info(
+                                    f"  ↳ tokens still on-chain (bal={on_chain_bal}), "
+                                    f"keeping for redemption"
+                                )
+                                continue
+                            # Already redeemed — record face-value PnL
+                            redeemed_value = pos.size * payout_ratio
+                            pnl = redeemed_value - pos.size_usdc
+                            self.risk.record_pnl(pnl)
+                        else:
+                            pnl = -pos.size_usdc
+                            self.risk.record_pnl(pnl)
                         self.positions.close_position(pos.market_id)
+                        self.risk.close_position(pos.market_id)
+                        self.kelly.close_position(pos.market_id)
                         self._add_exit_cooldown(pos.market_id)
                         removed += 1
                         state_changed = True
