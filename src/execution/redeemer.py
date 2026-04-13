@@ -159,7 +159,8 @@ class Redeemer:
     def _urlopen_json(url: str, timeout: int = 10) -> dict | list | None:
         """Sync HTTP GET that returns parsed JSON."""
         try:
-            return json.loads(urllib.request.urlopen(url, timeout=timeout).read())
+            req = urllib.request.Request(url, headers={"User-Agent": "polymarket-trader/1.0"})
+            return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
         except Exception:
             return None
 
@@ -259,6 +260,17 @@ class Redeemer:
             logger.error(f"Failed to get NegRisk token balances: {e}")
             return 0, 0
 
+    def get_token_balance(self, token_id: str) -> int | None:
+        """Return on-chain CTF balance for a token ID, or None if the probe failed."""
+        if not self._ensure_connected():
+            return None
+        try:
+            tid = int(token_id)
+            return self.ctf.functions.balanceOf(self.wallet, tid).call()
+        except Exception as e:
+            logger.debug(f"balanceOf failed for token {str(token_id)[:16]}...: {e}")
+            return None
+
     def _build_and_send_redeem_tx(
         self, condition_id: str, neg_risk: bool, token_id: str, cid_bytes: bytes
     ) -> tuple[bool, float]:
@@ -266,8 +278,15 @@ class Redeemer:
 
         Returns (success, tx_hash_or_zero).  Does NOT recurse.
         """
-        nonce = self.w3.eth.get_transaction_count(self.wallet, "pending")
-        gas_price = self.w3.eth.gas_price
+        # Pre-flight balance checks before fetching nonce/gas (avoid wasted RPCs)
+        if not neg_risk and token_id:
+            bal = self.get_token_balance(token_id)
+            if bal is None:
+                logger.warning(f"Token balance probe failed for {condition_id[:16]}... (standard)")
+                return False, 0.0
+            if bal == 0:
+                logger.info(f"No tokens to redeem for {condition_id[:16]}... (standard)")
+                return False, 0.0
 
         if neg_risk:
             yes_bal, no_bal = self._get_neg_risk_token_balances(condition_id, token_id=token_id)
@@ -279,6 +298,10 @@ class Redeemer:
                 f"🔄 NegRisk redeem {condition_id[:16]}... "
                 f"amounts=[YES={yes_bal / 1e6:.6f}, NO={no_bal / 1e6:.6f}]"
             )
+        nonce = self.w3.eth.get_transaction_count(self.wallet, "pending")
+        gas_price = self.w3.eth.gas_price
+
+        if neg_risk:
             tx = self.neg_risk_adapter.functions.redeemPositions(
                 cid_bytes, amounts
             ).build_transaction({
