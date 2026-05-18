@@ -1135,7 +1135,7 @@ class Trader:
         if self._cycle_count % self._redeem_interval_cycles == 0:
             await self._check_redemptions()
             # After possible redemption, resync CLOB balance so freed
-            # USDC.e is visible for the next entry attempt.
+            # pUSD collateral is visible for the next entry attempt.
             self.executor._sync_clob_balance()
 
         # ─── 7. Periodic on-chain position reconciliation ────
@@ -1168,7 +1168,7 @@ class Trader:
             side=OrderSide.BUY, price=entry_price, size=shares, token_id=token_id
         ):
             logger.info(
-                f"⏭️  Entry skipped for {opp.market_id}: insufficient USDC.e balance/allowance"
+                f"⏭️  Entry skipped for {opp.market_id}: insufficient pUSD balance/allowance"
             )
             return
 
@@ -1294,7 +1294,7 @@ class Trader:
             # Before retrying, sync CLOB balance allowance for this token
             # (the "not enough balance/allowance" error is often a CLOB cache miss)
             try:
-                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                from py_clob_client_v2 import BalanceAllowanceParams, AssetType
                 if self.executor._clob_client:
                     self.executor._clob_client.update_balance_allowance(
                         params=BalanceAllowanceParams(
@@ -1448,7 +1448,7 @@ class Trader:
         self.kelly.close_position(pos.market_id)
         # Start general exit cooldown — prevents re-entry for exit_cooldown_hours
         self._add_exit_cooldown(pos.market_id)
-        # Sync CLOB balance after exit so freed USDC.e is visible for next entry
+        # Sync CLOB balance after exit so freed pUSD collateral is visible for next entry
         self.executor._sync_clob_balance()
 
         logger.info(
@@ -1569,7 +1569,7 @@ class Trader:
 
             logger.info(
                 f"🏁 Redeemed {pos.market_id} {pos.side} — "
-                f"PnL: ${pnl:+.2f} | redeemed: ${redeemed:.4f} USDC.e"
+                f"PnL: ${pnl:+.2f} | redeemed: ${redeemed:.4f} collateral"
             )
 
     def _print_entry(self, opp, entry_price, shares, size_usdc, order) -> None:

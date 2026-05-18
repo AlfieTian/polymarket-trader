@@ -7,3 +7,11 @@ logs/
 *.egg-info/
 dist/
 build/
+
+# AI agent tool artifacts
+.codex
+.codex/
+AGENTS.md
+.cursor/
+.aider*
+CLAUDE.local.md

@@ -1,8 +1,8 @@
-"""Auto-redeem resolved Polymarket positions back to USDC.e.
+"""Auto-redeem resolved Polymarket positions back to collateral (pUSD/USDC.e).
 
 Checks on-chain payoutDenominator for each held position.
 If resolved, calls CTF.redeemPositions (or NegRiskAdapter for neg_risk markets)
-to convert conditional tokens back to USDC.e collateral.
+to convert conditional tokens back to collateral.
 
 For neg_risk (multi-outcome) markets:
 - Individual sub-market conditionIds resolve on CTF (payoutDenominator > 0)
@@ -26,6 +26,10 @@ logger = logging.getLogger("trader")
 
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+# pUSD: Polymarket's new collateral token (replaced USDC.e as of March 2026)
+PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+# Legacy USDC.e — still needed for CTF.redeemPositions collateral parameter
+# and as fallback balance check
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 RPC_LIST = [
     "https://polygon-rpc.com",
@@ -36,7 +40,9 @@ CTF_ABI = json.loads("""[
   {"inputs":[{"name":"","type":"bytes32"},{"name":"","type":"uint256"}],"name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
   {"inputs":[{"name":"","type":"bytes32"}],"name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
   {"inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"indexSets","type":"uint256[]"}],"name":"redeemPositions","outputs":[],"stateMutability":"nonpayable","type":"function"},
-  {"inputs":[{"name":"account","type":"address"},{"name":"id","type":"uint256"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
+  {"inputs":[{"name":"account","type":"address"},{"name":"id","type":"uint256"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+  {"inputs":[{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"indexSet","type":"uint256"}],"name":"getCollectionId","outputs":[{"name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},
+  {"inputs":[{"name":"collateralToken","type":"address"},{"name":"collectionId","type":"bytes32"}],"name":"getPositionId","outputs":[{"name":"","type":"uint256"}],"stateMutability":"pure","type":"function"}
 ]""")
 
 NEG_RISK_ABI = json.loads("""[
@@ -46,10 +52,11 @@ NEG_RISK_ABI = json.loads("""[
 ]""")
 
 USDC_ABI = json.loads('[{"inputs":[{"name":"","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]')
+PUSD_ABI = json.loads('[{"inputs":[{"name":"","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]')
 
 
 class Redeemer:
-    """Automatically redeem resolved positions to USDC.e."""
+    """Automatically redeem resolved positions to collateral (pUSD/USDC.e)."""
 
     def __init__(self, private_key: str, wallet_address: str):
         self.private_key = private_key
@@ -61,6 +68,7 @@ class Redeemer:
         self._wallet = None
         self._ctf = None
         self._neg_risk_adapter = None
+        self._pusd = None
         self._usdc = None
 
     def _ensure_connected(self) -> bool:
@@ -91,6 +99,9 @@ class Redeemer:
                     self._neg_risk_adapter = self._w3.eth.contract(
                         address=Web3.to_checksum_address(NEG_RISK_ADAPTER), abi=NEG_RISK_ABI
                     )
+                    self._pusd = self._w3.eth.contract(
+                        address=Web3.to_checksum_address(PUSD), abi=PUSD_ABI
+                    )
                     self._usdc = self._w3.eth.contract(
                         address=Web3.to_checksum_address(USDC_E), abi=USDC_ABI
                     )
@@ -116,6 +127,10 @@ class Redeemer:
     @property
     def neg_risk_adapter(self):
         return self._neg_risk_adapter
+
+    @property
+    def pusd(self):
+        return self._pusd
 
     @property
     def usdc(self):
@@ -271,10 +286,68 @@ class Redeemer:
             logger.debug(f"balanceOf failed for token {str(token_id)[:16]}...: {e}")
             return None
 
+    def _detect_standard_collateral(self, cid_bytes: bytes, token_id: str = "") -> str | None:
+        """Determine which collateral the tracked position's tokens use.
+
+        CTF position-token IDs are derived from (collateralToken, collectionId),
+        so the same condition has *distinct* token IDs for pUSD vs. USDC.e — and
+        a wallet may hold *both* the pUSD and the legacy USDC.e version.
+
+        When ``token_id`` is given we compute the position IDs for both
+        collaterals (index sets 1 and 2) and return the collateral whose
+        computed position ID *equals* the tracked token. This unambiguously
+        identifies the position even if the wallet also holds the same
+        condition under the other collateral.
+
+        Without a token_id (or no exact match) we fall back to whichever
+        collateral the wallet holds a YES/NO balance of, preferring pUSD.
+
+        All via read-only eth_calls — no gas. Returns PUSD / USDC_E, or None.
+        """
+        parent = b"\x00" * 32
+        target = None
+        if token_id:
+            try:
+                target = int(token_id)
+            except (ValueError, TypeError):
+                target = None
+        try:
+            balance_match = None
+            for collateral in (PUSD, USDC_E):
+                addr = Web3.to_checksum_address(collateral)
+                held = 0
+                for index_set in (1, 2):
+                    collection_id = self.ctf.functions.getCollectionId(
+                        parent, cid_bytes, index_set
+                    ).call()
+                    position_id = self.ctf.functions.getPositionId(
+                        addr, collection_id
+                    ).call()
+                    # Exact match on the tracked token wins immediately.
+                    if target is not None and position_id == target:
+                        return collateral
+                    held += self.ctf.functions.balanceOf(self.wallet, position_id).call()
+                if held > 0 and balance_match is None:
+                    balance_match = collateral
+            return balance_match
+        except Exception as e:
+            logger.debug(f"Collateral detection failed: {e}")
+            return None
+
     def _build_and_send_redeem_tx(
-        self, condition_id: str, neg_risk: bool, token_id: str, cid_bytes: bytes
+        self,
+        condition_id: str,
+        neg_risk: bool,
+        token_id: str,
+        cid_bytes: bytes,
+        collateral: str = PUSD,
     ) -> tuple[bool, float]:
         """Build, sign, and send a single redeem transaction.
+
+        ``collateral`` selects the ERC-20 collateral for standard CTF redemption
+        (ignored for neg_risk). CTF.redeemPositions only burns the position
+        tokens derived from the collateral passed in, so it must match the
+        collateral the tokens were minted against (pUSD for new, USDC.e legacy).
 
         Returns (success, tx_hash_or_zero).  Does NOT recurse.
         """
@@ -313,7 +386,7 @@ class Redeemer:
             })
         else:
             tx = self.ctf.functions.redeemPositions(
-                Web3.to_checksum_address(USDC_E),
+                Web3.to_checksum_address(collateral),
                 b'\x00' * 32,  # parentCollectionId = 0 for top-level
                 cid_bytes,
                 [1, 2],
@@ -330,55 +403,122 @@ class Redeemer:
         receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
         return receipt.status == 1, tx_hash
 
-    def redeem(self, condition_id: str, neg_risk: bool = False, token_id: str = "") -> float:
-        """Redeem resolved position. Returns USDC.e amount redeemed.
+    def _collateral_balance(self) -> int:
+        """Return total collateral balance (pUSD + USDC.e) in raw units."""
+        pusd_bal = self.pusd.functions.balanceOf(self.wallet).call()
+        usdc_bal = self.usdc.functions.balanceOf(self.wallet).call()
+        return pusd_bal + usdc_bal
 
-        If the initial method reverts, retries once with the alternate method
-        (standard CTF vs NegRiskAdapter) using a fresh nonce to avoid conflicts.
+    def redeem(self, condition_id: str, neg_risk: bool = False, token_id: str = "") -> float:
+        """Redeem resolved position. Returns collateral amount redeemed.
+
+        For standard markets the conditional tokens may have been minted against
+        pUSD (current) or legacy USDC.e — CTF.redeemPositions only burns tokens
+        derived from the collateral it is called with. We first detect the
+        correct collateral with read-only calls (no gas) and send a single
+        targeted redeem; only if detection is inconclusive do we fall back to
+        trying both. As a last resort (e.g. a mis-classified neg_risk market)
+        we try the NegRiskAdapter.
+
+        Wrapped in a guard so a transient balance-RPC failure returns 0.0
+        rather than aborting the caller's whole redemption cycle.
         """
         if not self._ensure_connected():
             return 0.0
-        bal_before = self.usdc.functions.balanceOf(self.wallet).call()
-        cid_bytes = bytes.fromhex(condition_id.replace("0x", ""))
-
         try:
-            success, tx_hash = self._build_and_send_redeem_tx(
-                condition_id, neg_risk, token_id, cid_bytes
-            )
-
-            if success:
-                bal_after = self.usdc.functions.balanceOf(self.wallet).call()
-                redeemed = (bal_after - bal_before) / 1e6
-                logger.info(
-                    f"💰 Redeemed {condition_id[:16]}... → +${redeemed:.4f} USDC.e "
-                    f"(tx: {tx_hash.hex()[:16]}...)"
-                )
-                return redeemed
-
-            # First method reverted — try the alternate method with a fresh nonce
-            if not neg_risk:
-                logger.debug(f"Standard redeem reverted, trying NegRisk adapter (fresh nonce)...")
-                try:
-                    success2, tx_hash2 = self._build_and_send_redeem_tx(
-                        condition_id, neg_risk=True, token_id=token_id, cid_bytes=cid_bytes
-                    )
-                    if success2:
-                        bal_after = self.usdc.functions.balanceOf(self.wallet).call()
-                        redeemed = (bal_after - bal_before) / 1e6
-                        logger.info(
-                            f"💰 Redeemed (NegRisk fallback) {condition_id[:16]}... "
-                            f"→ +${redeemed:.4f} USDC.e (tx: {tx_hash2.hex()[:16]}...)"
-                        )
-                        return redeemed
-                except Exception as e2:
-                    logger.warning(f"NegRisk fallback also failed: {e2}")
-
-            logger.warning(f"⚠️ Redeem reverted for {condition_id[:16]}...")
-            return 0.0
-
+            cid_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+            return self._redeem_impl(condition_id, neg_risk, token_id, cid_bytes)
         except Exception as e:
             logger.error(f"❌ Redeem error for {condition_id[:16]}...: {e}")
             return 0.0
+
+    def _redeem_impl(
+        self, condition_id: str, neg_risk: bool, token_id: str, cid_bytes: bytes
+    ) -> float:
+        """Core redemption logic — see redeem(). May raise on RPC failure."""
+
+        # ── neg_risk markets: single path via NegRiskAdapter ──
+        if neg_risk:
+            bal_before = self._collateral_balance()
+            try:
+                success, tx_hash = self._build_and_send_redeem_tx(
+                    condition_id, neg_risk=True, token_id=token_id, cid_bytes=cid_bytes
+                )
+            except Exception as e:
+                logger.error(f"❌ Redeem error for {condition_id[:16]}...: {e}")
+                return 0.0
+            if success:
+                redeemed = (self._collateral_balance() - bal_before) / 1e6
+                logger.info(
+                    f"💰 Redeemed {condition_id[:16]}... → +${redeemed:.4f} "
+                    f"(tx: {tx_hash.hex()[:16]}...)"
+                )
+                return redeemed
+            logger.warning(f"⚠️ Redeem reverted for {condition_id[:16]}...")
+            return 0.0
+
+        # ── standard markets: detect collateral via read-only calls, then
+        # send a single targeted redeem. Fall back to trying both only when
+        # detection is inconclusive (no balance found / probe failed). ──
+        detected = self._detect_standard_collateral(cid_bytes, token_id=token_id)
+        if detected:
+            candidates = [("pUSD" if detected == PUSD else "USDC.e", detected)]
+        else:
+            logger.debug(f"Collateral undetermined for {condition_id[:16]}..., trying both")
+            candidates = [("pUSD", PUSD), ("USDC.e", USDC_E)]
+
+        for collateral_name, collateral in candidates:
+            bal_before = self._collateral_balance()
+            try:
+                success, tx_hash = self._build_and_send_redeem_tx(
+                    condition_id, neg_risk=False, token_id=token_id,
+                    cid_bytes=cid_bytes, collateral=collateral,
+                )
+            except Exception as e:
+                logger.error(f"❌ Redeem error ({collateral_name}) for {condition_id[:16]}...: {e}")
+                continue
+            if not success:
+                logger.debug(f"{collateral_name} redeem reverted for {condition_id[:16]}..., trying next")
+                continue
+            redeemed = (self._collateral_balance() - bal_before) / 1e6
+            if redeemed > 1e-6:
+                logger.info(
+                    f"💰 Redeemed ({collateral_name}) {condition_id[:16]}... "
+                    f"→ +${redeemed:.4f} (tx: {tx_hash.hex()[:16]}...)"
+                )
+                return redeemed
+            # Redeem succeeded but paid $0. If the held tokens were burned the
+            # position is now cleared (we held the losing side) — stop here.
+            # If tokens remain, they use a different collateral — try the next.
+            if token_id:
+                remaining = self.get_token_balance(token_id)
+                if remaining == 0:
+                    logger.info(f"Redeemed {condition_id[:16]}... (losing side, $0 payout)")
+                    return 0.0
+            logger.debug(
+                f"{collateral_name} redeem paid $0 but tokens remain for "
+                f"{condition_id[:16]}..., trying alternate collateral"
+            )
+
+        # ── last resort: market may actually be neg_risk ──
+        logger.debug(f"Standard redeem failed for {condition_id[:16]}..., trying NegRisk adapter")
+        bal_before = self._collateral_balance()
+        try:
+            success2, tx_hash2 = self._build_and_send_redeem_tx(
+                condition_id, neg_risk=True, token_id=token_id, cid_bytes=cid_bytes
+            )
+            if success2:
+                redeemed = (self._collateral_balance() - bal_before) / 1e6
+                logger.info(
+                    f"💰 Redeemed (NegRisk fallback) {condition_id[:16]}... "
+                    f"→ +${redeemed:.4f} (tx: {tx_hash2.hex()[:16]}...)"
+                )
+                return redeemed
+        except Exception as e2:
+            logger.warning(f"NegRisk fallback also failed: {e2}")
+
+        logger.warning(f"⚠️ Redeem reverted for {condition_id[:16]}...")
+        return 0.0
 
     def check_and_redeem_all(self, positions: list[dict]) -> list[dict]:
         """Check all positions and redeem any that are resolved.

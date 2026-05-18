@@ -1,7 +1,7 @@
 """
 Polymarket API Client
 
-Uses py-clob-client SDK for real trading + REST for market discovery.
+Uses py-clob-client-v2 SDK for real trading + REST for market discovery.
 Automatically switches between mock and live mode based on credentials.
 """
 
@@ -149,11 +149,10 @@ class PolymarketClient:
         self._clob_client = None
 
     def _init_clob_client(self):
-        """Lazy-init the py-clob-client SDK."""
+        """Lazy-init the py-clob-client-v2 SDK."""
         if self._clob_client is None and self.has_credentials:
             try:
-                from py_clob_client.client import ClobClient
-                from py_clob_client.clob_types import ApiCreds
+                from py_clob_client_v2 import ClobClient, ApiCreds
 
                 creds = ApiCreds(
                     api_key=self.api_key,
@@ -162,11 +161,11 @@ class PolymarketClient:
                 )
                 self._clob_client = ClobClient(
                     host=self.CLOB_API,
-                    key=self.private_key,
                     chain_id=137,
+                    key=self.private_key,
                     creds=creds,
                 )
-                logger.info("✅ CLOB client initialized")
+                logger.info("✅ CLOB client initialized (v2)")
             except Exception as e:
                 logger.error(f"Failed to init CLOB client: {e}")
                 self._clob_client = None
@@ -336,17 +335,19 @@ class PolymarketClient:
         if not self._clob_client:
             raise RuntimeError("CLOB client not available — check credentials")
 
-        from py_clob_client.order_builder.constants import BUY, SELL
+        from py_clob_client_v2 import OrderArgs, Side
 
-        order_side = BUY if side == "BUY" else SELL
+        order_side = Side.BUY if side == "BUY" else Side.SELL
 
-        # Build and sign order
-        order_args = {
-            "token_id": token_id,
-            "price": price,
-            "size": size,
-            "side": order_side,
-        }
+        # Build and sign order. create_and_post_order expects an OrderArgs
+        # (alias of OrderArgsV2); the SDK accesses attributes like .token_id,
+        # so a plain dict would raise AttributeError inside create_order.
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=order_side,
+        )
 
         try:
             signed_order = self._clob_client.create_and_post_order(order_args)
@@ -367,7 +368,9 @@ class PolymarketClient:
             return False
 
         try:
-            self._clob_client.cancel(order_id)
+            from py_clob_client_v2 import OrderPayload
+
+            self._clob_client.cancel_order(OrderPayload(orderID=order_id))
             logger.info(f"✅ Cancelled order {order_id}")
             return True
         except Exception as e:
@@ -402,7 +405,7 @@ class PolymarketClient:
             return []
 
         try:
-            return self._clob_client.get_orders()
+            return self._clob_client.get_open_orders()
         except Exception as e:
             logger.error(f"Failed to fetch orders: {e}")
             return []

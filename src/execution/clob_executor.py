@@ -57,6 +57,11 @@ class Order:
 class CLOBExecutor:
     """Polymarket CLOB executor with full BUY/SELL support, tick_size, neg_risk."""
 
+    # Order statuses that count as "still on the book" — a v2 CLOB order may be
+    # reported under any of these. Used for both stale-order cancellation and
+    # live-order listing so the two never diverge.
+    _LIVE_ORDER_STATUSES = {"LIVE", "OPEN", "PENDING", "PARTIALLY_FILLED"}
+
     def __init__(
         self,
         clob_url: str = "https://clob.polymarket.com",
@@ -113,7 +118,7 @@ class CLOBExecutor:
             return {"balance": 0.0, "allowance": 0.0}
 
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2 import BalanceAllowanceParams, AssetType
 
             if asset_type.upper() == "COLLATERAL":
                 params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=0)
@@ -174,6 +179,10 @@ class CLOBExecutor:
 
         CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
         CTF_ABI = [{"inputs":[{"name":"account","type":"address"},{"name":"id","type":"uint256"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+        # pUSD: Polymarket's new collateral token (replaced USDC.e)
+        PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+        PUSD_ABI = [{"inputs":[{"name":"account","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+        # Legacy USDC.e — check as fallback in case funds haven't been migrated
         USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
         USDC_E_ABI = [{"inputs":[{"name":"account","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
         # Primary RPC; fallback list in case of SSL/403 issues
@@ -197,27 +206,48 @@ class CLOBExecutor:
         self._ctf_contract = self._w3.eth.contract(
             address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI
         )
+        self._pusd_contract = self._w3.eth.contract(
+            address=Web3.to_checksum_address(PUSD_ADDRESS), abi=PUSD_ABI
+        )
         self._usdc_e_contract = self._w3.eth.contract(
             address=Web3.to_checksum_address(USDC_E_ADDRESS), abi=USDC_E_ABI
         )
 
     def _onchain_usdc_balance(self, fail_closed: bool = True) -> float | None:
-        """Read USDC.e balance directly from Polygon chain (source of truth).
+        """Read spendable collateral balance directly from Polygon chain.
 
+        py-clob-client-v2 settles orders in pUSD only, so ONLY the pUSD balance
+        is spendable for placing orders. Legacy USDC.e cannot fund a v2 order —
+        it must be migrated to pUSD first. We therefore return the pUSD balance
+        and merely log USDC.e for visibility (warning if a stale balance lingers).
         Returns balance in USDC (raw / 1e6).
         """
         try:
             from web3 import Web3
             self._ensure_web3()
             wallet = Web3.to_checksum_address(self.wallet_address)
-            raw = self._usdc_e_contract.functions.balanceOf(wallet).call()
-            balance = raw / 1e6
-            logger.info(f"🔍 On-chain USDC.e balance: ${balance:.4f}")
-            return balance
+            pusd_raw = self._pusd_contract.functions.balanceOf(wallet).call()
+            balance = pusd_raw / 1e6
+            logger.info(f"🔍 On-chain spendable collateral: pUSD=${balance:.4f}")
         except Exception as e:
-            logger.warning(f"On-chain USDC.e balance check failed: {e}")
+            logger.warning(f"On-chain pUSD balance check failed: {e}")
             self._reset_web3()  # Force reconnect next call
             return 0.0 if fail_closed else None
+
+        # USDC.e lookup is informational only (a stale-balance warning). A failure
+        # here must NOT fail-close the BUY check — the pUSD balance above stands.
+        try:
+            usdc_e_raw = self._usdc_e_contract.functions.balanceOf(wallet).call()
+            usdc_e_balance = usdc_e_raw / 1e6
+            if usdc_e_balance > 0.01:
+                logger.warning(
+                    f"⚠️  ${usdc_e_balance:.4f} legacy USDC.e detected — not spendable "
+                    f"on the v2 CLOB. Migrate it to pUSD to make it usable."
+                )
+        except Exception as e:
+            logger.debug(f"USDC.e (informational) balance check failed: {e}")
+
+        return balance
 
     def _onchain_token_balance(self, token_id: str) -> float:
         """Check on-chain ERC-1155 conditional token balance via CTF contract.
@@ -249,7 +279,7 @@ class CLOBExecutor:
     ) -> bool:
         """Pre-check balance before placing an order.
 
-        BUY: check USDC.e balance/allowance via CLOB (update endpoint for freshness).
+        BUY: check spendable pUSD balance on-chain (source of truth).
         SELL: check conditional token balance on-chain via CTF contract (CLOB is unreliable here).
         """
         if self.dry_run:
@@ -257,11 +287,11 @@ class CLOBExecutor:
 
         if side == OrderSide.BUY:
             needed = size * price
-            # Use on-chain USDC.e balance as source of truth
+            # Use on-chain spendable pUSD balance as source of truth
             available = self._onchain_usdc_balance(fail_closed=True)
             if available + 1e-9 < needed:
                 logger.info(
-                    f"⏭️  Order skipped: on-chain USDC.e balance "
+                    f"⏭️  Order skipped: on-chain collateral balance "
                     f"${available:.4f} < needed ${needed:.4f}"
                 )
                 return False
@@ -286,10 +316,16 @@ class CLOBExecutor:
         if self.dry_run or not self._clob_client:
             return
         try:
-            orders = self._clob_client.get_orders()
+            from py_clob_client_v2 import OrderPayload
+
+            orders = self._clob_client.get_open_orders()
             if not isinstance(orders, list):
                 return
-            stale = [o for o in orders if o.get("asset_id") == token_id and o.get("status") == "LIVE"]
+            stale = [
+                o for o in orders
+                if o.get("asset_id") == token_id
+                and str(o.get("status") or o.get("state") or "").upper() in self._LIVE_ORDER_STATUSES
+            ]
             if not stale:
                 return
             stale_ids = [o["id"] for o in stale]
@@ -300,7 +336,7 @@ class CLOBExecutor:
                 # Fallback: cancel one by one
                 for oid in stale_ids:
                     try:
-                        self._clob_client.cancel(oid)
+                        self._clob_client.cancel_order(OrderPayload(orderID=oid))
                     except Exception as ce:
                         logger.warning(f"Failed to cancel order {oid[:16]}...: {ce}")
             logger.info(f"✅ Cancelled {len(stale_ids)} stale order(s)")
@@ -317,14 +353,13 @@ class CLOBExecutor:
             return []
 
         try:
-            orders = self._clob_client.get_orders()
+            orders = self._clob_client.get_open_orders()
             if not isinstance(orders, list):
                 return []
-            live_statuses = {"LIVE", "OPEN", "PENDING", "PARTIALLY_FILLED"}
             result = []
             for order in orders:
                 status = str(order.get("status") or order.get("state") or "").upper()
-                if status in live_statuses:
+                if status in self._LIVE_ORDER_STATUSES:
                     result.append(order)
             return result
         except Exception as e:
@@ -351,11 +386,13 @@ class CLOBExecutor:
             return 0
 
         try:
-            if hasattr(self._clob_client, "cancel_orders"):
+            from py_clob_client_v2 import OrderPayload
+
+            try:
                 self._clob_client.cancel_orders(order_ids)
-            else:
+            except Exception:
                 for oid in order_ids:
-                    self._clob_client.cancel(oid)
+                    self._clob_client.cancel_order(OrderPayload(orderID=oid))
             logger.warning(f"🧹 Cancelled {count} live CLOB order(s) during reconciliation")
             return count
         except Exception as e:
@@ -368,22 +405,21 @@ class CLOBExecutor:
         if not self.private_key:
             return
         try:
-            from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
+            from py_clob_client_v2 import ClobClient
 
-            # Use create_or_derive to ensure L2 auth is available (env creds sometimes 401)
-            _l1 = ClobClient(host=self.clob_url, key=self.private_key, chain_id=137)
-            creds = _l1.create_or_derive_api_creds()
+            # Use create_or_derive_api_key to ensure L2 auth is available
+            _l1 = ClobClient(host=self.clob_url, chain_id=137, key=self.private_key)
+            creds = _l1.create_or_derive_api_key()
 
             self._clob_client = ClobClient(
                 host=self.clob_url,
-                key=self.private_key,
                 chain_id=137,
+                key=self.private_key,
                 creds=creds,
                 signature_type=0,
                 funder=self.wallet_address,
             )
-            logger.info("✅ CLOB client initialized (creds derived)")
+            logger.info("✅ CLOB client initialized (v2, creds derived)")
 
             # Sync on-chain balance snapshot on startup
             self._sync_clob_balance()
@@ -391,9 +427,9 @@ class CLOBExecutor:
             logger.error(f"Failed to init CLOB client: {e}")
 
     def _sync_clob_balance(self):
-        """Notify CLOB to refresh on-chain token/USDC balances, fixing 'not enough balance/allowance' errors."""
+        """Notify CLOB to refresh on-chain token/pUSD balances, fixing 'not enough balance/allowance' errors."""
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2 import BalanceAllowanceParams, AssetType
             from .position_manager import STATE_FILE
             import json
             # Refresh USDC
@@ -492,8 +528,7 @@ class CLOBExecutor:
             return order
 
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
-            from py_clob_client.order_builder.constants import BUY, SELL
+            from py_clob_client_v2 import OrderArgs, PartialCreateOrderOptions, Side
 
             # Get tick_size, neg_risk, min_order_size
             meta = self.fetch_market_meta(condition_id) if condition_id else {"tick_size": "0.01", "neg_risk": False, "min_order_size": 5}
@@ -557,7 +592,7 @@ class CLOBExecutor:
                 token_id=token_id,
                 price=snapped_price,
                 size=safe_size,
-                side=BUY if side == OrderSide.BUY else SELL,
+                side=Side.BUY if side == OrderSide.BUY else Side.SELL,
             )
             options = PartialCreateOrderOptions(
                 tick_size=meta["tick_size"],
@@ -664,7 +699,9 @@ class CLOBExecutor:
             return False
 
         try:
-            self._clob_client.cancel(order_id)
+            from py_clob_client_v2 import OrderPayload
+
+            self._clob_client.cancel_order(OrderPayload(orderID=order_id))
             order.status = OrderStatus.CANCELLED
             logger.info(f"✅ Cancelled {order_id}")
             return True

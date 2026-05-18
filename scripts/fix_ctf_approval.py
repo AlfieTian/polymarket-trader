@@ -21,11 +21,13 @@ RPC         = "https://polygon-bor-rpc.publicnode.com"
 # ERC-1155 Conditional Token contract (Polygon mainnet)
 CTF_TOKEN = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
-# Operators to approve (exchange contracts)
+# Operators to approve (v1 + v2 exchange contracts)
 OPERATORS = [
-    ("CTF Exchange",           "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"),
-    ("Neg Risk CTF Exchange",  "0xC5d563A36AE78145C45a50134d48A1215220f80a"),
-    ("NegRisk Adapter",        "0xd91E80cF2Ed2FD526D61a6fdfc9F5ADfA75F0F4b"),
+    ("CTF Exchange v1",           "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"),
+    ("Neg Risk CTF Exchange v1",  "0xC5d563A36AE78145C45a50134d48A1215220f80a"),
+    ("NegRisk Adapter",           "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"),
+    ("CTF Exchange v2",           "0xE111180000d2663C0091e4f400237545B87B996B"),
+    ("Neg Risk CTF Exchange v2",  "0xe2222d279d744050d28e00520010520000310F59"),
 ]
 
 def rpc_call(method, params):

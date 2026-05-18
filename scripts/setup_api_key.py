@@ -42,17 +42,17 @@ def main():
     print(f"   Wallet: {wallet_address[:8]}...{wallet_address[-6:]}")
 
     try:
-        from py_clob_client.client import ClobClient
+        from py_clob_client_v2 import ClobClient
 
         # Step 1: Create temporary client, derive API credentials
         temp_client = ClobClient(
             host="https://clob.polymarket.com",
-            key=private_key,
             chain_id=137,  # Polygon mainnet
+            key=private_key,
         )
 
-        # create_or_derive: returns existing creds if available, otherwise creates new ones
-        creds = temp_client.create_or_derive_api_creds()
+        # create_or_derive_api_key: returns existing creds if available, otherwise creates new ones
+        creds = temp_client.create_or_derive_api_key()
 
         api_key = creds.api_key
         api_secret = creds.api_secret
@@ -75,8 +75,8 @@ def main():
         print("\n  Verifying credentials...")
         client = ClobClient(
             host="https://clob.polymarket.com",
-            key=private_key,
             chain_id=137,
+            key=private_key,
             creds=creds,
             signature_type=0,  # EOA wallet
             funder=wallet_address,
@@ -99,7 +99,7 @@ def main():
         print("\nTroubleshooting:")
         print("  1. Check private key format (64 hex chars, with or without 0x prefix)")
         print("  2. Ensure wallet has some POL for gas")
-        print("  3. Ensure wallet has USDC.e for trading")
+        print("  3. Ensure wallet has pUSD collateral for trading")
         print("  4. Ensure network can reach clob.polymarket.com")
         sys.exit(1)
 

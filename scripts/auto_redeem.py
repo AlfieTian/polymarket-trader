@@ -80,7 +80,7 @@ def main():
         details = ", ".join(
             f"{r['market_id']}: +${r['amount']:.2f}" for r in results
         )
-        msg = f"💰 Auto-redeem: {len(results)} position(s) redeemed, +${total:.2f} USDC.e total. {details}"
+        msg = f"💰 Auto-redeem: {len(results)} position(s) redeemed, +${total:.2f} collateral total. {details}"
         logger.info(msg)
 
         # Remove redeemed from pending (regardless of amount — $0 positions are also done)

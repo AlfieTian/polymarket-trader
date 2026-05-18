@@ -17,13 +17,22 @@ PRIVATE_KEY    = os.environ["POLYMARKET_PRIVATE_KEY"]
 WALLET         = os.environ["POLYMARKET_WALLET_ADDRESS"]
 RPC            = "https://polygon-bor-rpc.publicnode.com"
 
-# Polygon USDC.e
+# pUSD (new Polymarket collateral) and legacy USDC.e
+PUSD           = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 USDC_E         = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
-# Polymarket contracts (CTF Exchange + Neg Risk CTF Exchange)
+# Polymarket contracts (v1 + v2 exchanges)
 SPENDERS = [
-    ("CTF Exchange",          "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"),
-    ("Neg Risk CTF Exchange", "0xC5d563A36AE78145C45a50134d48A1215220f80a"),
+    ("CTF Exchange v1",          "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"),
+    ("Neg Risk CTF Exchange v1", "0xC5d563A36AE78145C45a50134d48A1215220f80a"),
+    ("CTF Exchange v2",          "0xE111180000d2663C0091e4f400237545B87B996B"),
+    ("Neg Risk CTF Exchange v2", "0xe2222d279d744050d28e00520010520000310F59"),
+]
+
+# Collateral tokens to approve (pUSD for new, USDC.e for legacy)
+COLLATERAL_TOKENS = [
+    ("pUSD",   PUSD),
+    ("USDC.e", USDC_E),
 ]
 
 # Avoid unlimited approval to reduce blast radius if spender is compromised.
@@ -56,31 +65,32 @@ def main():
     gas_price = int(int(rpc("eth_gasPrice", []), 16) * 1.2)
     print(f"Gas Price: {gas_price / 1e9:.2f} Gwei\n")
 
-    for name, spender in SPENDERS:
-        print(f"  Approve {name}...")
+    for token_name, token_addr in COLLATERAL_TOKENS:
+        for name, spender in SPENDERS:
+            print(f"  Approve {token_name} → {name}...")
 
-        tx = {
-            "nonce":    nonce,
-            "to":       USDC_E,
-            "value":    0,
-            "data":     "0x" + encode_approve(spender, MAX_UINT256).hex(),
-            "gas":      100000,
-            "gasPrice": gas_price,
-            "chainId":  137,
-        }
+            tx = {
+                "nonce":    nonce,
+                "to":       token_addr,
+                "value":    0,
+                "data":     "0x" + encode_approve(spender, MAX_UINT256).hex(),
+                "gas":      100000,
+                "gasPrice": gas_price,
+                "chainId":  137,
+            }
 
-        signed = acct.sign_transaction(tx)
-        raw_hex = "0x" + signed.raw_transaction.hex()
+            signed = acct.sign_transaction(tx)
+            raw_hex = "0x" + signed.raw_transaction.hex()
 
-        try:
-            tx_hash = rpc("eth_sendRawTransaction", [raw_hex])
-            print(f"  Tx broadcast OK: {tx_hash}")
-            print(f"     https://polygonscan.com/tx/{tx_hash}")
-        except Exception as e:
-            print(f"  Failed: {e}")
+            try:
+                tx_hash = rpc("eth_sendRawTransaction", [raw_hex])
+                print(f"  Tx broadcast OK: {tx_hash}")
+                print(f"     https://polygonscan.com/tx/{tx_hash}")
+            except Exception as e:
+                print(f"  Failed: {e}")
 
-        nonce += 1
-        time.sleep(1)
+            nonce += 1
+            time.sleep(1)
 
     print("\nWaiting for tx confirmation (~5-10s)...")
     time.sleep(10)

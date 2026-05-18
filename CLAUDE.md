@@ -25,7 +25,7 @@ uv run python scripts/backtest.py
 # Check LLM calibration
 uv run python scripts/calibration_check.py
 
-# One-time setup: approve USDC.e allowance on-chain (needed before live trading)
+# One-time setup: approve pUSD/USDC.e allowance on-chain (needed before live trading)
 uv run python scripts/approve_allowance.py
 uv run python scripts/onchain_approve.py
 
@@ -52,7 +52,7 @@ PolymarketClient.get_markets()
       → EdgeDetector.scan_markets()  (EV = p̂ - market_price, threshold min_edge)
         → KellySizer.calculate()  (fractional Kelly, portfolio cap)
           → RiskManager.validate_trade()  (daily loss, concentration limits)
-            → CLOBExecutor.place_order()  (BUY via py-clob-client)
+            → CLOBExecutor.place_order()  (BUY via py-clob-client-v2)
               → PositionManager.add_position()  (persisted to logs/positions_state.json)
 ```
 
@@ -69,9 +69,9 @@ Exits run **before** the LLM fetch (fast path: price-based stops/TPs) and **afte
 | `src/strategy/performance_tracker.py` | Tracks closed trades; drives adaptive parameter updates |
 | `src/data/polymarket_client.py` | REST market discovery + sports/esports ban list |
 | `src/data/news_feed.py` | Fetches news, calls LLM, converts sentiment to `Signal` objects |
-| `src/execution/clob_executor.py` | `CLOBExecutor` — wraps `py-clob-client`; dry-run aware |
+| `src/execution/clob_executor.py` | `CLOBExecutor` — wraps `py-clob-client-v2`; dry-run aware |
 | `src/execution/position_manager.py` | Persistent position state in `logs/positions_state.json` |
-| `src/execution/redeemer.py` | On-chain redemption of resolved CTF positions |
+| `src/execution/redeemer.py` | On-chain redemption of resolved CTF positions (pUSD collateral) |
 | `src/risk/risk_manager.py` | Daily loss, market concentration, per-market loss limits |
 
 ### State persistence

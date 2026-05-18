@@ -12,8 +12,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams
+from py_clob_client_v2 import ClobClient, ApiCreds, AssetType, BalanceAllowanceParams
 
 HOST           = "https://clob.polymarket.com"
 KEY            = os.environ["POLYMARKET_PRIVATE_KEY"]
@@ -31,8 +30,8 @@ def main():
     )
     client = ClobClient(
         host=HOST,
-        key=KEY,
         chain_id=137,
+        key=KEY,
         creds=creds,
         signature_type=0,
         funder=WALLET_ADDRESS,
