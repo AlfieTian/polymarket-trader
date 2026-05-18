@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
 
@@ -127,16 +127,39 @@ class PositionManager:
 
     # ─── Persistence ──────────────────────────────────────────
     def _load_state(self):
-        """Restore positions from disk after restart."""
+        """Restore positions from disk after restart.
+
+        Each record is loaded independently so that a single malformed entry
+        (e.g. an old state file written before a field was added) only drops
+        that one position instead of abandoning every position.
+        """
+        if not STATE_FILE.exists():
+            return
         try:
-            if STATE_FILE.exists():
-                data = json.loads(STATE_FILE.read_text())
-                for d in data:
-                    p = Position(**d)
-                    self._positions[p.market_id] = p
-                logger.info(f"📂 Restored {len(self._positions)} positions from disk")
+            data = json.loads(STATE_FILE.read_text())
         except Exception as e:
-            logger.warning(f"Could not restore position state: {e}")
+            logger.warning(f"Could not read position state file: {e}")
+            return
+
+        known = {f.name for f in fields(Position)}
+        restored, skipped = 0, 0
+        for d in data:
+            try:
+                # Tolerate unknown keys from older/newer state-file versions.
+                clean = {k: v for k, v in d.items() if k in known}
+                p = Position(**clean)
+                self._positions[p.market_id] = p
+                restored += 1
+            except Exception as e:
+                skipped += 1
+                logger.warning(
+                    f"Skipping unloadable position record "
+                    f"{d.get('market_id', '?') if isinstance(d, dict) else '?'}: {e}"
+                )
+        logger.info(
+            f"📂 Restored {restored} positions from disk"
+            + (f" ({skipped} skipped — malformed)" if skipped else "")
+        )
 
     def _save_state(self):
         """Persist current positions to disk."""

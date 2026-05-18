@@ -211,7 +211,13 @@ def test_execute_exit_partial_fill_updates_remaining_exposure():
     assert trader.risk.set_calls == [("m1", 3.0)]
     assert trader.kelly.set_calls == [("m1", 3.0)]
     assert trader.risk.pnl == [pytest.approx(0.88)]
-    assert trader.perf.closed == []
+    # The filled portion is recorded to the performance tracker so partial
+    # exits feed adaptive tuning / calibration like full closes.
+    assert len(trader.perf.closed) == 1
+    partial = trader.perf.closed[0]
+    assert partial.exit_reason == "profit_target_partial"
+    assert partial.realized_pnl == pytest.approx(0.88)
+    assert partial.size_usdc == pytest.approx(2.0)
 
 
 def test_execute_exit_records_actual_fill_price_in_trade_history():

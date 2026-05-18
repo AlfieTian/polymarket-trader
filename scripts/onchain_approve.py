@@ -54,20 +54,45 @@ def encode_approve(spender: str, amount: int) -> bytes:
     return bytes.fromhex("095ea7b3") + spender_bytes + amount_bytes
 
 
+def wait_for_receipt(tx_hash: str, timeout: int = 120) -> bool:
+    """Poll for a transaction receipt; return True only if it mined with status 1."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            receipt = rpc("eth_getTransactionReceipt", [tx_hash])
+        except Exception:
+            receipt = None
+        if receipt:
+            return int(receipt.get("status", "0x0"), 16) == 1
+        time.sleep(3)
+    return False
+
+
 def main():
     acct: LocalAccount = Account.from_key(PRIVATE_KEY)
     print(f"Wallet: {acct.address}\n")
 
+    # The transaction is signed by the private key; its nonce must be fetched
+    # for the *key's* address, not a (possibly mismatched) env-var address.
+    if WALLET and WALLET.lower() != acct.address.lower():
+        print(f"⚠️  POLYMARKET_WALLET_ADDRESS ({WALLET}) != key address "
+              f"({acct.address}) — using the key address.")
+    signer = acct.address
+
     # Current nonce
-    nonce = int(rpc("eth_getTransactionCount", [WALLET, "pending"]), 16)
+    nonce = int(rpc("eth_getTransactionCount", [signer, "pending"]), 16)
 
     # Current gas price (+20% buffer)
     gas_price = int(int(rpc("eth_gasPrice", []), 16) * 1.2)
     print(f"Gas Price: {gas_price / 1e9:.2f} Gwei\n")
 
+    sent: list[tuple[str, str]] = []   # (label, tx_hash)
+    failed = False
+
     for token_name, token_addr in COLLATERAL_TOKENS:
         for name, spender in SPENDERS:
-            print(f"  Approve {token_name} → {name}...")
+            label = f"{token_name} → {name}"
+            print(f"  Approve {label}...")
 
             tx = {
                 "nonce":    nonce,
@@ -86,15 +111,28 @@ def main():
                 tx_hash = rpc("eth_sendRawTransaction", [raw_hex])
                 print(f"  Tx broadcast OK: {tx_hash}")
                 print(f"     https://polygonscan.com/tx/{tx_hash}")
+                sent.append((label, tx_hash))
+                nonce += 1   # only advance nonce once a tx is actually accepted
             except Exception as e:
-                print(f"  Failed: {e}")
+                print(f"  Failed to broadcast {label}: {e}")
+                failed = True
 
-            nonce += 1
             time.sleep(1)
 
-    print("\nWaiting for tx confirmation (~5-10s)...")
-    time.sleep(10)
-    print("Done! The bot can now place orders.")
+    # Confirm each transaction actually mined with status 1 — a broadcast is
+    # not a success; a tx can still revert (e.g. out of gas).
+    print("\nConfirming on-chain receipts...")
+    for label, tx_hash in sent:
+        if wait_for_receipt(tx_hash):
+            print(f"  ✅ Confirmed: {label}")
+        else:
+            print(f"  ❌ NOT confirmed (reverted or timed out): {label}  {tx_hash}")
+            failed = True
+
+    if failed:
+        print("\n❌ Some approvals failed — check the errors above before trading.")
+        sys.exit(1)
+    print("\nDone! The bot can now place orders.")
 
 
 if __name__ == "__main__":

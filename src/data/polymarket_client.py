@@ -476,6 +476,16 @@ class PolymarketClient:
             outcomes_raw = item.get("outcomes", "[]")
             outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
 
+            # The bot only trades binary YES/NO markets. Market.no_price /
+            # no_token_id use index [1], which for a categorical (3+ outcome)
+            # market is an arbitrary other outcome — a nonsensical "NO" leg.
+            # Skip anything that is not exactly two outcomes.
+            if not isinstance(outcomes, list) or len(outcomes) != 2:
+                logger.debug(
+                    f"Skipping non-binary market {item.get('id', '')}: outcomes={outcomes}"
+                )
+                return None
+
             prices_raw = item.get("outcomePrices", "[]")
             prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
             prices = [float(p) for p in prices]

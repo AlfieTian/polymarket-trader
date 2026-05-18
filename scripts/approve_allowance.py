@@ -37,16 +37,18 @@ def main():
         funder=WALLET_ADDRESS,
     )
 
+    failed = False
+
     print("\nCurrent balance & allowance status:")
     try:
         bal = client.get_balance_allowance(
             params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
-        print(f"  USDC Balance:   {bal}")
+        print(f"  pUSD Balance:   {bal}")
     except Exception as e:
         print(f"  Query failed: {e}")
 
-    print("\nSetting USDC Allowance (COLLATERAL)...")
+    print("\nSetting pUSD Allowance (COLLATERAL)...")
     try:
         result = client.update_balance_allowance(
             params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
@@ -54,15 +56,15 @@ def main():
         print(f"  Allowance set successfully: {result}")
     except Exception as e:
         print(f"  Failed: {e}")
+        failed = True
 
-    print("\nSetting Conditional Token Allowance...")
-    try:
-        result = client.update_balance_allowance(
-            params=BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL)
-        )
-        print(f"  Conditional Allowance set successfully: {result}")
-    except Exception as e:
-        print(f"  Failed: {e}")
+    # NOTE: Conditional-token (ERC-1155) approval is NOT done here.
+    # update_balance_allowance(CONDITIONAL) needs a specific token_id and is a
+    # no-op without one — it cannot blanket-approve conditional tokens. The
+    # correct operation is the on-chain setApprovalForAll, handled by
+    # scripts/fix_ctf_approval.py. Run that to enable selling NO/YES tokens.
+    print("\nConditional-token approval: run scripts/fix_ctf_approval.py "
+          "(setApprovalForAll) — skipped here.")
 
     print("\nPost-approval balance & status:")
     try:
@@ -73,7 +75,11 @@ def main():
     except Exception as e:
         print(f"  Query failed: {e}")
 
-    print("\nDone! You can now place orders.")
+    if failed:
+        print("\n❌ Allowance setup FAILED — fix the error above before trading.")
+        sys.exit(1)
+    print("\nDone! Collateral allowance set. "
+          "Run scripts/fix_ctf_approval.py before selling tokens.")
 
 if __name__ == "__main__":
     main()

@@ -72,13 +72,17 @@ def run_backtest(
     kelly_fraction: float = 0.25,
     min_edge: float = 0.03,
     initial_bankroll: float = 1000.0,
+    seed: int = 42,
 ):
     """Run a simple backtest."""
     console.print(f"\n[bold]📊 Backtest: true_prob={true_prob}, n_steps={n_steps}[/bold]")
     console.print(f"   Kelly fraction: {kelly_fraction}x, Min edge: {min_edge}")
     console.print(f"   Initial bankroll: ${initial_bankroll:.2f}\n")
 
-    data = generate_synthetic_market(n_steps=n_steps, true_prob=true_prob)
+    # Seeded generator so outcome simulation is reproducible (was the unseeded
+    # global np.random, which made every backtest run produce different numbers).
+    rng = np.random.default_rng(seed)
+    data = generate_synthetic_market(n_steps=n_steps, true_prob=true_prob, seed=seed)
 
     engine = BayesianEngine(prior_weight=0.5, min_observations=1)
     detector = EdgeDetector(min_edge=min_edge)
@@ -121,12 +125,12 @@ def run_backtest(
         if opp is None:
             continue
 
-        # Size position
+        # Size position — KellySizer expects the YES price for both sides.
         pos = sizer.calculate(
             market_id=market_id,
             side=opp.side,
             p_hat=opp.p_hat,
-            market_price=opp.market_price,
+            market_price=d["market_price"],
             bankroll=bankroll,
         )
 
@@ -135,13 +139,15 @@ def run_backtest(
 
         n_trades += 1
 
-        # Simulate outcome (simplified: resolve based on true probability)
-        resolved_yes = np.random.random() < true_prob
+        # Simulate outcome (simplified: resolve based on true probability).
+        # opp.market_price is already the entry-side price, so the gross return
+        # multiple is 1/entry_price - 1 for whichever side we took.
+        resolved_yes = rng.random() < true_prob
 
         if opp.side == "YES":
             pnl = pos.position_usdc * (1 / opp.market_price - 1) if resolved_yes else -pos.position_usdc
         else:
-            pnl = pos.position_usdc * (1 / (1 - opp.market_price) - 1) if not resolved_yes else -pos.position_usdc
+            pnl = pos.position_usdc * (1 / opp.market_price - 1) if not resolved_yes else -pos.position_usdc
 
         bankroll += pnl
         total_pnl += pnl

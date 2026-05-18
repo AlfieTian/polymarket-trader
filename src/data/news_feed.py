@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -358,12 +359,13 @@ Respond in JSON format ONLY:
     def _parse_llm_response(self, text: str, market_id: str, headlines: list[str]) -> LLMAnalysis | None:
         """Parse LLM JSON response into LLMAnalysis."""
         try:
-            # Extract JSON from response (handle markdown wrapping)
+            # Extract the JSON object from the response. Robust to markdown
+            # fences (```json / ```JSON / ``` ), language tags, and leading
+            # prose — grab from the first '{' to the last '}'.
             text = text.strip()
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if match:
+                text = match.group(0)
             result = json.loads(text)
 
             prob = float(result["probability"])

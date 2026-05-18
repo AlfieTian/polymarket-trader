@@ -69,6 +69,10 @@ def main():
     acct = Account.from_key(PRIVATE_KEY)
     print(f"Wallet: {acct.address}")
     print(f"CTF Token contract: {CTF_TOKEN}\n")
+    if WALLET and WALLET.lower() != acct.address.lower():
+        print(f"⚠️  POLYMARKET_WALLET_ADDRESS ({WALLET}) != key address "
+              f"({acct.address}). setApprovalForAll approves the key's tokens; "
+              f"ensure these match or approvals/checks will target different accounts.\n")
 
     # Check current approval status
     print("Checking current approval status...")
@@ -104,7 +108,7 @@ def main():
 
     print(f"\nBroadcasting transactions ({action_label})...\n")
 
-    nonce     = int(rpc_call("eth_getTransactionCount", [WALLET, "pending"]), 16)
+    nonce     = int(rpc_call("eth_getTransactionCount", [acct.address, "pending"]), 16)
     gas_price = int(int(rpc_call("eth_gasPrice", []), 16) * 1.2)
     print(f"Gas Price: {gas_price/1e9:.2f} Gwei | Starting nonce: {nonce}\n")
 

@@ -21,19 +21,30 @@ logger = logging.getLogger(__name__)
 _TRADE_HISTORY_FILE = Path(__file__).parent.parent.parent / "logs" / "trade_history.json"
 _RISK_STATE_FILE = Path(__file__).parent.parent.parent / "logs" / "risk_state.json"
 
+# The per-market cumulative-loss limit only counts losses from trades closed
+# within this rolling window — otherwise a market that lost money once is
+# banned for the entire life of the trade-history file.
+_LOSS_WINDOW_DAYS = 7.0
 
-def _load_market_realized_losses() -> dict[str, float]:
-    """Read trade_history.json and sum realized losses per market_id.
+
+def _load_market_realized_losses(window_days: float = _LOSS_WINDOW_DAYS) -> dict[str, float]:
+    """Read trade_history.json and sum *recent* realized losses per market_id.
 
     Returns dict[market_id, total_loss_usdc] — losses as positive numbers.
-    Only counts negative PnL entries (wins are ignored for this check).
+    Only counts negative-PnL trades closed within the last `window_days`
+    (wins are ignored — this is a loss-only re-entry guardrail). Trades with
+    no `closed_at` timestamp (pre-dating timestamping) are counted regardless.
     """
     if not _TRADE_HISTORY_FILE.exists():
         return {}
     try:
         trades: list[dict] = json.loads(_TRADE_HISTORY_FILE.read_text())
+        cutoff = time.time() - window_days * 86400
         losses: dict[str, float] = {}
         for t in trades:
+            closed_at = float(t.get("closed_at", 0.0) or 0.0)
+            if closed_at and closed_at < cutoff:
+                continue  # outside the rolling window
             pnl = t.get("realized_pnl", 0.0) or 0.0
             if pnl < 0:
                 mid = t.get("market_id", "")
@@ -114,9 +125,16 @@ class RiskManager:
             self._daily_pnl = float(data.get("daily_pnl", 0.0) or 0.0)
             self._daily_reset_date = str(data.get("daily_reset_date", "") or "")
             self._halted = bool(data.get("halted", False))
+            # Restore the per-market exposure map so validate_trade enforces
+            # portfolio/concentration limits even before the trader reconciles.
+            self._positions = {
+                str(k): float(v)
+                for k, v in (data.get("positions", {}) or {}).items()
+            }
             logger.info(
                 f"📂 Restored risk state: date={self._daily_reset_date or 'n/a'} "
-                f"daily_pnl=${self._daily_pnl:+.2f} halted={self._halted}"
+                f"daily_pnl=${self._daily_pnl:+.2f} halted={self._halted} "
+                f"exposure=${self.total_exposure:.2f}"
             )
         except Exception as e:
             logger.warning(f"Could not restore risk state: {e}")
@@ -130,6 +148,7 @@ class RiskManager:
                     "daily_pnl": round(self._daily_pnl, 6),
                     "daily_reset_date": self._daily_reset_date,
                     "halted": self._halted,
+                    "positions": {k: round(v, 6) for k, v in self._positions.items()},
                 },
                 indent=2,
             )
@@ -242,6 +261,7 @@ class RiskManager:
     def record_position(self, market_id: str, size_usdc: float) -> None:
         """Record a new or increased position."""
         self._positions[market_id] = self._positions.get(market_id, 0.0) + size_usdc
+        self._save_state()
         logger.info(
             f"Position recorded: {market_id} +${size_usdc:.2f} "
             f"(total market: ${self._positions[market_id]:.2f}, "
@@ -255,6 +275,7 @@ class RiskManager:
             return
         old_size = self._positions.get(market_id, 0.0)
         self._positions[market_id] = size_usdc
+        self._save_state()
         logger.info(
             f"Position updated: {market_id} ${old_size:.2f}→${size_usdc:.2f} "
             f"(portfolio: ${self.total_exposure:.2f})"
@@ -264,8 +285,10 @@ class RiskManager:
         """Remove a market from position tracking."""
         removed = self._positions.pop(market_id, 0)
         if removed:
+            self._save_state()
             logger.info(f"Position closed: {market_id} (was ${removed:.2f})")
 
     def reset_positions(self) -> None:
         """Rebuild exposure tracking from persisted/open positions after restart."""
         self._positions.clear()
+        self._save_state()

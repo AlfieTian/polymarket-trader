@@ -81,11 +81,16 @@ class KellySizer:
         For YES bets: f* = (p̂ - p) / (1 - p)
         For NO bets:  f* = (p - p̂) / p
 
+        Both formulas are expressed in the YES convention: `p_hat` is the
+        estimated probability of YES and `market_price` is the YES-outcome
+        price. Callers must pass the YES price even for NO trades (recover it
+        as `1 - no_price` if they hold the side-normalised price).
+
         Args:
             market_id: Market identifier
             side: "YES" or "NO"
             p_hat: Our estimated probability of YES
-            market_price: Current market price for this side
+            market_price: Current YES-outcome market price (0-1), for both sides
             bankroll: Available bankroll in USDC
 
         Returns:

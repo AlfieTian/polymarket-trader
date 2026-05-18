@@ -36,6 +36,12 @@ class Signal:
     timestamp: float = field(default_factory=time.time)
     metadata: dict = field(default_factory=dict)
 
+    def __post_init__(self):
+        # confidence is a 0-1 reliability weight used to temper the likelihood
+        # update; clamp it so an out-of-range value (e.g. an LLM returning 1.5)
+        # cannot over-weight a single signal and corrupt the posterior.
+        self.confidence = min(max(float(self.confidence), 0.0), 1.0)
+
     @property
     def log_likelihood_ratio(self) -> float:
         """Log likelihood ratio: log(P(D|YES)) - log(P(D|NO))"""

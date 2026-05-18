@@ -41,6 +41,17 @@ console = Console()
 logger = logging.getLogger("trader")
 
 
+def _atomic_write_json(path: Path, obj) -> None:
+    """Write JSON via a temp file + atomic rename so a crash mid-write cannot
+    corrupt the file (a corrupt cooldown/pending file is silently treated as
+    empty on load, which would wipe active cooldowns)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(obj, indent=2))
+    os.replace(tmp_path, path)
+
+
 def load_config(path: str = "config.yaml") -> dict:
     config_path = Path(__file__).parent.parent / path
     with open(config_path) as f:
@@ -182,8 +193,7 @@ class Trader:
         return {}
 
     def _save_cooldown(self) -> None:
-        self._cooldown_file.parent.mkdir(parents=True, exist_ok=True)
-        self._cooldown_file.write_text(json.dumps(self._force_close_cooldown))
+        _atomic_write_json(self._cooldown_file, self._force_close_cooldown)
 
     def _add_cooldown(self, market_id: str) -> None:
         self._force_close_cooldown[market_id] = time.time()
@@ -212,8 +222,7 @@ class Trader:
         return {}
 
     def _save_exit_cooldown(self) -> None:
-        self._exit_cooldown_file.parent.mkdir(parents=True, exist_ok=True)
-        self._exit_cooldown_file.write_text(json.dumps(self._exit_cooldown))
+        _atomic_write_json(self._exit_cooldown_file, self._exit_cooldown)
 
     def _add_exit_cooldown(self, market_id: str) -> None:
         self._exit_cooldown[market_id] = time.time()
@@ -242,8 +251,7 @@ class Trader:
         return []
 
     def _save_pending_orders(self) -> None:
-        self._pending_orders_file.parent.mkdir(parents=True, exist_ok=True)
-        self._pending_orders_file.write_text(json.dumps(self._pending_orders, indent=2))
+        _atomic_write_json(self._pending_orders_file, self._pending_orders)
 
     @staticmethod
     def _normalize_entry_order(size_usdc: float, entry_price: float, min_shares: float = 5.0) -> tuple[float, float]:
@@ -498,7 +506,7 @@ class Trader:
         for pos in list(self.positions.open_positions):
             # Check if market has resolved — remove losing positions, redeem winners
             if pos.condition_id:
-                resolution = self.redeemer.is_resolved(pos.condition_id)
+                resolution = await asyncio.to_thread(self.redeemer.is_resolved, pos.condition_id)
                 if resolution is not None:
                     payout = resolution["payout_yes"] if pos.side == "YES" else resolution["payout_no"]
                     denominator = resolution.get("denominator", 1) or 1
@@ -533,7 +541,9 @@ class Trader:
                         continue
                     # Won — check if tokens are already redeemed (balance=0).
                     # If so, close the position rather than deferring forever.
-                    on_chain_bal = self.redeemer.get_token_balance(pos.token_id)
+                    on_chain_bal = await asyncio.to_thread(
+                        self.redeemer.get_token_balance, pos.token_id
+                    )
                     if on_chain_bal is None:
                         logger.warning(
                             f"⚠️  On-chain reconcile: balance probe failed for "
@@ -569,7 +579,9 @@ class Trader:
                     # Won with tokens still on-chain — leave for _check_redemptions
                     continue
 
-            actual_balance = self.executor._onchain_token_balance(pos.token_id)
+            actual_balance = await asyncio.to_thread(
+                self.executor._onchain_token_balance, pos.token_id
+            )
             if actual_balance == float("inf"):
                 continue  # RPC failed, skip
 
@@ -639,7 +651,9 @@ class Trader:
                 continue
 
             # Verify on-chain balance
-            onchain_size = self.executor._onchain_token_balance(token_id)
+            onchain_size = await asyncio.to_thread(
+                self.executor._onchain_token_balance, token_id
+            )
             if onchain_size == float("inf") or onchain_size < 0.01:
                 continue
 
@@ -648,15 +662,19 @@ class Trader:
             condition_id = rp.get("conditionId", "")
             if condition_id:
                 try:
-                    resolution = self.redeemer.is_resolved(condition_id)
+                    resolution = await asyncio.to_thread(
+                        self.redeemer.is_resolved, condition_id
+                    )
                     if resolution is not None:
                         logger.info(
                             f"⏭️  Skipping phantom {token_id[:16]}... — "
                             f"market already resolved"
                         )
                         continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        f"Resolution check failed for phantom {token_id[:16]}...: {e}"
+                    )
             market_id = rp.get("market", "") or rp.get("marketId", "") or condition_id
             side = rp.get("side", "YES").upper()
             if side not in ("YES", "NO"):
@@ -665,6 +683,11 @@ class Trader:
             # Skip if this market is in exit cooldown (recently closed/zombie-cleaned)
             if self._in_exit_cooldown(market_id):
                 logger.debug(f"⏭️  Skipping phantom {token_id[:16]}... — exit cooldown active")
+                continue
+            # Skip if in force-close cooldown — a force_close_failed market may
+            # still hold tokens on-chain; re-adding it would loop the failing exit.
+            if self._in_cooldown(market_id):
+                logger.debug(f"⏭️  Skipping phantom {token_id[:16]}... — force-close cooldown active")
                 continue
 
             # Try to get entry price from the API position data
@@ -772,9 +795,15 @@ class Trader:
             logger.info(
                 f"🔄 Syncing {len(restored)} persisted positions → RiskManager & KellySizer"
             )
+        # Cap each position's tracked exposure to max_position_usdc. Phantom /
+        # legacy positions can exceed it on-chain; pos.size keeps the true share
+        # count for exit sizing, but risk & Kelly exposure must stay capped
+        # (otherwise this resync silently undoes the phantom-discovery cap).
+        max_pos = self.config.get("strategy", {}).get("max_position_usdc", 5.0)
         for pos in restored:
-            self.risk.record_position(pos.market_id, pos.size_usdc)
-            self.kelly.record_position(pos.market_id, pos.size_usdc)
+            tracked = min(pos.size_usdc, max_pos)
+            self.risk.record_position(pos.market_id, tracked)
+            self.kelly.record_position(pos.market_id, tracked)
 
     def _set_portfolio_exposure(self, market_id: str, size_usdc: float) -> None:
         """Keep RiskManager and KellySizer aligned with the current position size."""
@@ -924,6 +953,10 @@ class Trader:
     async def run_cycle(self) -> None:
         t0 = time.perf_counter()
 
+        # Advance the cycle counter up front so the redeem/reconcile schedules
+        # below stay on cadence even if an earlier step raises mid-cycle.
+        self._cycle_count += 1
+
         # ─── 0. Check pending orders from previous cycles ─────
         self._check_pending_orders()
 
@@ -1063,13 +1096,16 @@ class Trader:
                     f"p̂={opp.p_hat:.3f} recent_conf={avg_conf:.2f}"
                 )
 
-                # Kelly sizing
+                # Kelly sizing — KellySizer's formulas use the YES price for
+                # both sides. EdgeDetector normalised opp.market_price to the
+                # entry side, so recover the YES price for NO opportunities.
                 bankroll = self.kelly.remaining_capacity
+                yes_price = opp.market_price if opp.side == "YES" else (1.0 - opp.market_price)
                 pos_size = self.kelly.calculate(
                     market_id=opp.market_id,
                     side=opp.side,
                     p_hat=opp.p_hat,
-                    market_price=opp.market_price,
+                    market_price=yes_price,
                     bankroll=bankroll,
                 )
                 if pos_size.position_usdc <= 0:
@@ -1106,7 +1142,9 @@ class Trader:
                     continue
 
                 if not self.dry_run:
-                    onchain_balance = self.executor._onchain_usdc_balance(fail_closed=False)
+                    onchain_balance = await asyncio.to_thread(
+                        self.executor._onchain_usdc_balance, fail_closed=False
+                    )
                     if onchain_balance is None:
                         logger.warning(
                             f"⚠️  On-chain balance pre-check unavailable for {opp.market_id} "
@@ -1131,12 +1169,11 @@ class Trader:
             )
 
         # ─── 6. Auto-redeem resolved positions ──────────────
-        self._cycle_count += 1
         if self._cycle_count % self._redeem_interval_cycles == 0:
             await self._check_redemptions()
             # After possible redemption, resync CLOB balance so freed
             # pUSD collateral is visible for the next entry attempt.
-            self.executor._sync_clob_balance()
+            await asyncio.to_thread(self.executor._sync_clob_balance)
 
         # ─── 7. Periodic on-chain position reconciliation ────
         if self._cycle_count % self._reconcile_interval_cycles == 0:
@@ -1245,6 +1282,17 @@ class Trader:
         """
         from src.execution.clob_executor import OrderStatus
 
+        # Backfill a missing condition_id from market metadata so the resolved-
+        # market check can run (a resolved market with no condition_id would
+        # otherwise skip straight to a CLOB sell and burn the exit-retry budget).
+        if not pos.condition_id:
+            mkt = market_map.get(pos.market_id)
+            cid = getattr(mkt, "condition_id", "") if mkt else ""
+            if cid:
+                pos.condition_id = cid
+                self.positions._save_state()
+                logger.info(f"🔧 Backfilled condition_id for {pos.market_id}")
+
         # Skip CLOB sell for already-resolved markets — the redeemer handles those.
         if pos.condition_id:
             resolution = await asyncio.to_thread(self.redeemer.is_resolved, pos.condition_id)
@@ -1319,14 +1367,44 @@ class Trader:
                 )
 
         # Pre-flight: use on-chain balance as sell size (source of truth)
-        actual_balance = self.executor._onchain_token_balance(pos.token_id)
+        actual_balance = await asyncio.to_thread(
+            self.executor._onchain_token_balance, pos.token_id
+        )
         if actual_balance == float("inf"):
             actual_balance = pos.size  # RPC failed, fallback
         sell_size = actual_balance
         if sell_size < 0.01:
-            logger.warning(
-                f"⏭️  Exit skipped for {pos.market_id}: on-chain balance too low ({actual_balance:.4f})"
+            # Tokens are gone but the market is NOT resolved (checked above) —
+            # an earlier exit order almost certainly filled out-of-band between
+            # cycles. Close the position and record PnL with the best estimate
+            # available (the price that triggered this exit) rather than leaving
+            # a zombie whose realized PnL never reaches the trackers.
+            est_exit_price = pos.exit_price_override or current_price
+            est_pnl = (est_exit_price - pos.entry_price) * pos.size
+            est_pnl_pct = (
+                (est_exit_price - pos.entry_price) / pos.entry_price
+                if pos.entry_price else 0.0
             )
+            logger.warning(
+                f"🧹 Exit reconcile for {pos.market_id}: on-chain balance "
+                f"{actual_balance:.4f} ~ 0 — prior exit order likely filled out-of-band. "
+                f"Closing with estimated PnL ${est_pnl:+.2f} @ ~${est_exit_price:.3f}"
+            )
+            self.risk.record_pnl(est_pnl)
+            self.positions.close_position(pos.market_id)
+            self.risk.close_position(pos.market_id)
+            self.kelly.close_position(pos.market_id)
+            self._add_exit_cooldown(pos.market_id)
+            self.perf.record_close(ClosedTrade(
+                market_id=pos.market_id,
+                side=pos.side,
+                entry_price=pos.entry_price,
+                exit_price=est_exit_price,
+                size_usdc=pos.size_usdc,
+                realized_pnl=round(est_pnl, 4),
+                realized_pnl_pct=round(est_pnl_pct, 4),
+                exit_reason=f"{reason}_reconciled",
+            ))
             return
         if abs(sell_size - pos.size) > 0.001:
             logger.info(
@@ -1416,6 +1494,19 @@ class Trader:
                 # Record partial PnL
                 partial_pnl = (avg_price - pos.entry_price) * filled
                 self.risk.record_pnl(partial_pnl)
+                # Record the filled portion to the performance tracker too, so
+                # partial exits feed adaptive tuning / calibration like full closes.
+                partial_cost = pos.size_usdc * (filled / pos.size) if pos.size > 0 else 0.0
+                self.perf.record_close(ClosedTrade(
+                    market_id=pos.market_id,
+                    side=pos.side,
+                    entry_price=pos.entry_price,
+                    exit_price=avg_price,
+                    size_usdc=round(partial_cost, 4),
+                    realized_pnl=round(partial_pnl, 4),
+                    realized_pnl_pct=round(partial_pnl / partial_cost, 4) if partial_cost else 0.0,
+                    exit_reason=f"{reason}_partial",
+                ))
                 # Reduce position size to remaining unfilled portion
                 remaining = pos.size - filled
                 scale = remaining / pos.size if pos.size > 0 else 1.0
@@ -1449,7 +1540,7 @@ class Trader:
         # Start general exit cooldown — prevents re-entry for exit_cooldown_hours
         self._add_exit_cooldown(pos.market_id)
         # Sync CLOB balance after exit so freed pUSD collateral is visible for next entry
-        self.executor._sync_clob_balance()
+        await asyncio.to_thread(self.executor._sync_clob_balance)
 
         logger.info(
             f"🚪 Closed {pos.market_id} {pos.side} [{reason}] — "
@@ -1488,6 +1579,8 @@ class Trader:
     async def _check_redemptions(self) -> None:
         """Check all open positions for on-chain resolution and auto-redeem."""
         for pos in list(self.positions.open_positions):
+            if not pos.condition_id:
+                continue  # cannot check resolution without a condition_id
             resolution = await asyncio.to_thread(self.redeemer.is_resolved, pos.condition_id)
             if resolution is None:
                 continue
@@ -1586,7 +1679,7 @@ class Trader:
 
     async def run(self) -> None:
         self._running = True
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self._shutdown)
 
