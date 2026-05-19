@@ -498,6 +498,21 @@ class PolymarketClient:
             tokens_raw = item.get("clobTokenIds", "[]")
             token_ids = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
 
+            # Normalise ordering so index 0 is always Yes and index 1 is No.
+            # Polymarket usually returns ["Yes","No"] but the order is not
+            # guaranteed; Market.yes_*/no_* rely on this positional convention,
+            # so a reversed ["No","Yes"] would otherwise invert every trade.
+            yes_idx = next(
+                (i for i, o in enumerate(outcomes) if str(o).strip().lower() == "yes"),
+                0,
+            )
+            if yes_idx == 1:
+                outcomes = [outcomes[1], outcomes[0]]
+                if len(prices) == 2:
+                    prices = [prices[1], prices[0]]
+                if len(token_ids) == 2:
+                    token_ids = [token_ids[1], token_ids[0]]
+
             token_list = [
                 {"token_id": tid, "outcome": out}
                 for tid, out in zip(token_ids, outcomes)

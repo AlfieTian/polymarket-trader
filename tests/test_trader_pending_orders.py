@@ -220,6 +220,44 @@ def test_execute_exit_partial_fill_updates_remaining_exposure():
     assert partial.size_usdc == pytest.approx(2.0)
 
 
+def test_execute_exit_partial_fill_triggers_adaptive_tuning():
+    """A partial exit that hits the evaluation interval must run adaptive
+    tuning, exactly like a full close (it routes through _record_close)."""
+    trader = Trader.__new__(Trader)
+    trader.positions = _DummyExitPositions()
+    trader.risk = _DummyExposure()
+    trader.kelly = _DummyExposure()
+
+    new_params = {"kelly_fraction": 0.30, "min_edge": 0.04, "max_position_usdc": 7.0}
+    trader.perf = SimpleNamespace(
+        closed=[],
+        record_close=lambda t: trader.perf.closed.append(t),
+        should_evaluate=lambda: True,
+        suggest_adjustments=lambda current: new_params,
+    )
+    trader.executor = _DummyExitExecutor(
+        OrderStatus.PARTIALLY_FILLED, filled_size=4.0, filled_avg_price=0.72
+    )
+    trader.redeemer = SimpleNamespace(is_resolved=lambda condition_id: None)
+    trader._add_exit_cooldown = lambda market_id: None
+    trader._strat_cfg = {}
+    trader.edge_detector = SimpleNamespace(min_edge=0.05)
+
+    pos = Position(
+        market_id="m1", condition_id="c1", token_id="t1", side="YES",
+        entry_price=0.50, size=10.0, size_usdc=5.0,
+        p_hat_at_entry=0.55, market_price_at_entry=0.50,
+    )
+
+    asyncio.run(trader._execute_exit(pos, current_price=0.80, market_map={}, reason="profit_target"))
+
+    # Adaptive tuning was applied off the back of the partial close.
+    assert trader.kelly.kelly_fraction == 0.30
+    assert trader.kelly.max_position_usdc == 7.0
+    assert trader.edge_detector.min_edge == 0.04
+    assert trader._strat_cfg == new_params
+
+
 def test_execute_exit_records_actual_fill_price_in_trade_history():
     trader = Trader.__new__(Trader)
     trader.positions = _DummyExitPositions()
