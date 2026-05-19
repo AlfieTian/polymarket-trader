@@ -70,9 +70,11 @@ def main():
     print(f"Wallet: {acct.address}")
     print(f"CTF Token contract: {CTF_TOKEN}\n")
     if WALLET and WALLET.lower() != acct.address.lower():
-        print(f"⚠️  POLYMARKET_WALLET_ADDRESS ({WALLET}) != key address "
-              f"({acct.address}). setApprovalForAll approves the key's tokens; "
-              f"ensure these match or approvals/checks will target different accounts.\n")
+        print(f"❌ POLYMARKET_WALLET_ADDRESS ({WALLET}) != key address ({acct.address}).")
+        print("   This script checks approval for, and signs setApprovalForAll from,")
+        print("   the SAME account — a mismatch would report approvals for one address")
+        print("   while approving another. Fix .env so the two match, then re-run.")
+        sys.exit(1)
 
     # Check current approval status
     print("Checking current approval status...")

@@ -535,7 +535,7 @@ class Trader:
                             realized_pnl_pct=-1.0,
                             exit_reason="resolution_reconcile",
                         )
-                        self.perf.record_close(_trade)
+                        self._record_close(_trade)
                         removed += 1
                         state_changed = True
                         continue
@@ -572,7 +572,7 @@ class Trader:
                             realized_pnl_pct=round(pnl_win / pos.size_usdc, 4) if pos.size_usdc else 0,
                             exit_reason="resolution_reconcile",
                         )
-                        self.perf.record_close(_trade)
+                        self._record_close(_trade)
                         removed += 1
                         state_changed = True
                         continue
@@ -958,7 +958,10 @@ class Trader:
         self._cycle_count += 1
 
         # ─── 0. Check pending orders from previous cycles ─────
-        self._check_pending_orders()
+        # _check_pending_orders is synchronous and does blocking CLOB + Web3
+        # I/O (order-status refresh, on-chain balance probes), so run it off
+        # the event loop to avoid stalling the whole cycle.
+        await asyncio.to_thread(self._check_pending_orders)
 
         # ─── 1. Fetch markets ─────────────────────────────────
         markets = await self.client.get_markets(limit=100, min_volume=1000)
@@ -1395,7 +1398,7 @@ class Trader:
             self.risk.close_position(pos.market_id)
             self.kelly.close_position(pos.market_id)
             self._add_exit_cooldown(pos.market_id)
-            self.perf.record_close(ClosedTrade(
+            self._record_close(ClosedTrade(
                 market_id=pos.market_id,
                 side=pos.side,
                 entry_price=pos.entry_price,
@@ -1497,7 +1500,7 @@ class Trader:
                 # Record the filled portion to the performance tracker too, so
                 # partial exits feed adaptive tuning / calibration like full closes.
                 partial_cost = pos.size_usdc * (filled / pos.size) if pos.size > 0 else 0.0
-                self.perf.record_close(ClosedTrade(
+                self._record_close(ClosedTrade(
                     market_id=pos.market_id,
                     side=pos.side,
                     entry_price=pos.entry_price,
@@ -1559,6 +1562,15 @@ class Trader:
             realized_pnl_pct=round(pnl_pct, 4),
             exit_reason=reason,
         )
+        self._record_close(trade)
+
+    def _record_close(self, trade: ClosedTrade) -> None:
+        """Record a closed trade and run adaptive parameter tuning when due.
+
+        Used by every close path — CLOB exit, partial exit, out-of-band
+        reconcile and on-chain resolution — so tuning fires consistently on
+        the EVAL_EVERY cadence regardless of how a trade closed.
+        """
         self.perf.record_close(trade)
 
         # Adaptive strategy adjustment (every EVAL_EVERY trades)
@@ -1658,7 +1670,7 @@ class Trader:
                 realized_pnl_pct=round(pnl / closed_size_usdc, 4) if closed_size_usdc else 0,
                 exit_reason="resolution",
             )
-            self.perf.record_close(trade)
+            self._record_close(trade)
 
             logger.info(
                 f"🏁 Redeemed {pos.market_id} {pos.side} — "
